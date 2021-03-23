@@ -11,7 +11,7 @@ import torch.distributed as dist
 from torch.utils.data import Dataset
 from tqdm import tqdm
 import sys
-sys.path.append('/data/private/chenyutong/Oscar')
+sys.path.append('/data/private/liuwenchang/oscar/Oscar')
 from oscar.utils.logger import setup_logger
 from oscar.utils.tsv_file import TSVFile
 from oscar.utils.tsv_file_ops import (tsv_writer, concat_tsv_files,
@@ -95,7 +95,7 @@ class CaptionTSVDataset(Dataset):
         num_boxes = int(self.feat_tsv.seek(img_idx)[1])
         features = np.frombuffer(base64.b64decode(self.feat_tsv.seek(img_idx)[2]), np.float32
                 ).reshape((num_boxes, -1))[:]
-        return torch.Tensor(features)
+        return torch.Tensor(np.array(features))
 
     def get_od_labels(self, img_idx):
         od_labels = None
@@ -475,8 +475,8 @@ def train(args, train_dataloader, val_dataset, model, tokenizer, writer):
             global_acc += batch_acc
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 global_step += 1
-                scheduler.step()
                 optimizer.step()
+                scheduler.step()
                 model.zero_grad()
                 if global_step % args.logging_steps == 0:
                     logger.info("Epoch: {}, global_step: {}, lr: {:.6f}, loss: {:.4f} ({:.4f}), " \
@@ -484,17 +484,20 @@ def train(args, train_dataloader, val_dataset, model, tokenizer, writer):
                         optimizer.param_groups[0]["lr"], loss, global_loss / global_step, 
                         batch_acc, global_acc / global_step)
                     )
-                    writer.add_scalar('loss', loss, global_step=global_step)
-                    writer.add_scalar('batch_acc', batch_acc, global_step=global_step)
+                    if writer != None:
+                        writer.add_scalar('loss', loss, global_step=global_step)
+                        writer.add_scalar('batch_acc', batch_acc, global_step=global_step)
+                        writer.add_scalar('lr', optimizer.param_groups[0]["lr"], global_step=global_step)
 
                 if (args.save_steps > 0 and global_step % args.save_steps == 0) or \
                         global_step == t_total:
                     checkpoint_dir = save_checkpoint(model, tokenizer, args, epoch, global_step) 
                     # evaluation
-                    if args.evaluate_during_training: 
-                        logger.info("Perform evaluation at step: %d" % (global_step))
-                        evaluate(args, val_dataset, model, tokenizer,
-                                checkpoint_dir, writer, global_step)
+                    if args.evaluate_during_training:
+                        if not args.distributed or (args.local_rank==0): 
+                            logger.info("Perform evaluation at step: %d" % (global_step))
+                            evaluate(args, val_dataset, model, tokenizer,
+                                    checkpoint_dir, writer, global_step)
                         # with open(evaluate_file, 'r') as f:
                         #     res = json.load(f)
                         # best_score = max(best_score, res['CIDEr'])
@@ -652,8 +655,8 @@ def test(args, test_dataloader, model, tokenizer, writer, global_step):
 
         writer.add_scalar('validation_accuracy', average_accuracy, global_step)
         writer.add_scalar('validation_loss', average_loss, global_step)
-    if get_world_size() > 1:
-        torch.distributed.barrier()
+    # if get_world_size() > 1:
+    #     torch.distributed.barrier()
     return pred_results, labels, average_accuracy
 
 
@@ -884,6 +887,8 @@ def main():
 
     if not args.distributed or (args.local_rank==0):
         writer = SummaryWriter(logdir=output_dir)
+    else:
+        writer = None
     # Load pretrained model and tokenizer
     config_class, model_class, tokenizer_class = BertConfig, BertForVIVOPretraining, BertTokenizer
     if args.do_train:
