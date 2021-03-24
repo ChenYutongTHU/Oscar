@@ -1,22 +1,21 @@
 export WORLD_SIZE="8"
-srun -N 1 -G 8 python -m torch.distributed.launch --nproc_per_node=8 oscar/run_VIVO_pretrain.py \
+srun -c 20 -N 1 -G 8 python -m torch.distributed.launch --nproc_per_node=8 oscar/run_VIVO_pretrain.py \
     --model_name_or_path ../pretrained_models/bert_base_uncased \
     --do_train \
     --do_lower_case \
     --add_od_labels \
-    --learning_rate 5e-5 --weight_decay 0.05 --adam_epsilon 1e-8 --max_grad_norm 1 --warmup_steps 0 --scheduler linear \
-    --per_gpu_train_batch_size 128 \
+    --learning_rate 5e-5 --weight_decay 0.05 --adam_epsilon 1e-8 --max_grad_norm 10 --warmup_steps 0 --scheduler linear \
+    --per_gpu_train_batch_size 256 \
     --gradient_accumulation_steps 1 \
     --num_train_epochs 100 \
     --tie_weights \
-    --freeze_embedding \
     --data_dir /data/private/NocapsData/VIVO_pretrain_data \
-    --num_workers 4 \
+    --num_workers 12 \
     --output_dir ../output/pretrain \
-    --max_seq_length 15  --max_seq_a_length 15 --max_img_seq_length 50 \
+    --max_seq_length 17  --max_seq_a_length 17 --max_img_seq_length 50 \
     --mask_prob 0.15 --max_masked_tokens 3 \
-    --logging_steps 100 --save_steps 5000 \
-    --evaluate_during_training --whole_word
+    --logging_steps 500 --save_steps 5000 \
+    --evaluate_during_training --whole_word --use_img_layernorm 1
     #--evaluate_during_training
     
 # python oscar/run_captioning.py \

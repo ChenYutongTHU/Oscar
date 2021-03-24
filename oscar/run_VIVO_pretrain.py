@@ -192,7 +192,7 @@ class CaptionTensorizer(object):
                 random.shuffle(candidate_masked_tags)
             num_masked = min(max(round(self.mask_prob * num_tags), 1), self.max_masked_tokens) #--> tag
             num_masked = int(num_masked)   #when evaluating masking the first few tags
-            assert num_masked<=num_tags
+            assert num_masked<=num_tags, (num_tags, tags, num_masked, text_a)
             masked_tag_idx = candidate_masked_tags[:num_masked]
             masked_tag_idx = sorted(masked_tag_idx)
             masked_token, masked_idx, masked_whole_word = [], [], []
@@ -345,7 +345,7 @@ def make_data_loader(args, yaml_file, tokenizer, is_distributed=True,
     return data_loader
 
 
-def save_checkpoint(model, tokenizer, args, epoch, iteration, num_trial=10):
+def save_checkpoint(model, tokenizer, args, epoch, iteration, optimizer, scheduler, num_trial=10):
     checkpoint_dir = op.join(args.output_dir, 'checkpoint-{}-{}'.format(
         epoch, iteration))
     if not is_main_process():
@@ -356,6 +356,12 @@ def save_checkpoint(model, tokenizer, args, epoch, iteration, num_trial=10):
         try:
             model_to_save.save_pretrained(checkpoint_dir)
             torch.save(args, op.join(checkpoint_dir, 'training_args.bin'))
+            torch.save({
+                'epoch': epoch,
+                'global_step': iteration,
+                'scheduler': scheduler.state_dict(),
+                'optimizer': optimizer.state_dict(),
+            }, op.join(checkpoint_dir, 'epoch_step_opt_sc.bin'))
             tokenizer.save_pretrained(checkpoint_dir)
             logger.info("Save checkpoint to {}".format(checkpoint_dir))
             break
@@ -406,6 +412,13 @@ def train(args, train_dataloader, val_dataset, model, tokenizer, writer):
     else:
         raise ValueError("Unknown scheduler type: {}".format(args.scheduler))
 
+    # restore scheduler, optimizer
+    if os.path.exists(op.join(args.model_name_or_path, 'epoch_step_opt_sc.bin')):
+        training_state = torch.load(op.join(args.model_name_or_path, 'epoch_step_opt_sc.bin'))
+        optimizer.load_state_dict(training_state['optimizer'])
+        scheduler.load_state_dict(training_state['scheduler'])
+        logger.info("  Loading optimizer and scheduler from {}".format(op.join(args.model_name_or_path, 'epoch_step_opt_sc.bin')))
+
     logger.info("***** Running training *****")
     logger.info("  Num Epochs = %d", args.num_train_epochs)
     logger.info("  Batch size per GPU = %d", args.per_gpu_train_batch_size)
@@ -426,7 +439,10 @@ def train(args, train_dataloader, val_dataset, model, tokenizer, writer):
     model.zero_grad()
     eval_log = []
     best_score = 0
+    checkpoint_dir = None
     for epoch in range(int(args.num_train_epochs)):
+        if args.distributed:
+            train_dataloader.sampler.set_epoch(epoch)
         for step, (img_keys, batch) in enumerate(train_dataloader):
             tags = batch[-1]
             batch = tuple(t.to(args.device) for t in batch[:-1])
@@ -491,7 +507,7 @@ def train(args, train_dataloader, val_dataset, model, tokenizer, writer):
 
                 if (args.save_steps > 0 and global_step % args.save_steps == 0) or \
                         global_step == t_total:
-                    checkpoint_dir = save_checkpoint(model, tokenizer, args, epoch, global_step) 
+                    checkpoint_dir = save_checkpoint(model, tokenizer, args, epoch, global_step, optimizer, scheduler) 
                     # evaluation
                     if args.evaluate_during_training:
                         if not args.distributed or (args.local_rank==0): 
@@ -670,18 +686,9 @@ def restore_training_settings(args):
         checkpoint = args.eval_model_dir
     # restore training settings, check hasattr for backward compatibility
     train_args = torch.load(op.join(checkpoint, 'training_args.bin'))
-    if hasattr(train_args, 'max_seq_a_length'):
-        if hasattr(train_args, 'scst') and train_args.scst:
-            max_od_labels_len = train_args.max_seq_length - train_args.max_gen_length
-        else:
-            max_od_labels_len = train_args.max_seq_length - train_args.max_seq_a_length
-        max_seq_length = args.max_gen_length + max_od_labels_len
-        args.max_seq_length = max_seq_length
-        logger.warning('Override max_seq_length to {} = max_gen_length:{} + od_labels_len:{}'.format(
-                max_seq_length, args.max_gen_length, max_od_labels_len))
 
 
-    override_params = ['max_seq_a_length', 'do_lower_case', 'add_od_labels',
+    override_params = ['max_seq_a_length', 'do_lower_case', 'add_od_labels', 'max_seq_length',
             'max_img_seq_length']
     for param in override_params:
         if hasattr(train_args, param):
@@ -865,6 +872,12 @@ def main():
                         help='Use constrained beam search for decoding')
     parser.add_argument('--min_constraints_to_satisfy', type=int, default=2,
                         help="minimum number of constraints to satisfy")
+    # use layer norm
+    parser.add_argument("--use_img_layernorm", type=int, default=0,
+                        help="Normalize image features with bertlayernorm")
+    parser.add_argument("--img_layer_norm_eps", default=1e-12, type=float,
+                        help="The eps in image feature laynorm layer")
+
     args = parser.parse_args()
 
     global logger
@@ -896,6 +909,8 @@ def main():
         config = config_class.from_pretrained(args.config_name if args.config_name else \
                 args.model_name_or_path, num_labels=args.num_labels, finetuning_task='VIVO_pretraining') #?
         config.whole_word = args.whole_word
+        config.img_layer_norm_eps = args.img_layer_norm_eps
+        config.use_img_layernorm = args.use_img_layernorm
         config.task = 'VIVO'
         if args.scst:
             # avoid using too much memory
