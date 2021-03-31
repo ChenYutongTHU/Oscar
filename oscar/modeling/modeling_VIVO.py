@@ -37,8 +37,9 @@ class BertHungarianLoss(torch.nn.Module):
         else:
             M = logits.size(0)
         prob = self.softmax(logits) #num_masked, n_class
-        C_max = 0
+        C_max = -100
         target_best = None
+        records = []
         for p in permutations(range(0,M)): #assign target i to the p[i]-th predictions
             p = list(p)
             if self.whole_word:
@@ -51,9 +52,11 @@ class BertHungarianLoss(torch.nn.Module):
                 target_p = target[p] # num_masked
             C_ = torch.gather(prob,1,target_p.unsqueeze(1))  #num_masked, 1
             C_ = torch.sum(C_)
+            records.append(C_)
             if C_>C_max:
                 target_best = target_p
                 C_max = C_
+        assert target_best!=None, (M,records)
         loss = self.CE(input=logits, target=target_best) #num_masked, 
         return loss, target_best
 

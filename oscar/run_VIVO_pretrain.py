@@ -11,7 +11,8 @@ import torch.distributed as dist
 from torch.utils.data import Dataset
 from tqdm import tqdm
 import sys
-sys.path.append('/data/private/liuwenchang/oscar/Oscar')
+#sys.path.append('/data/private/liuwenchang/oscar/Oscar')
+sys.path.append('/data/private/chenyutong/Oscar')
 from oscar.utils.logger import setup_logger
 from oscar.utils.tsv_file import TSVFile
 from oscar.utils.tsv_file_ops import (tsv_writer, concat_tsv_files,
@@ -27,7 +28,7 @@ from oscar.modeling.modeling_VIVO import BertForVIVOPretraining
 from oscar_transformers.pytorch_transformers import BertTokenizer, BertConfig
 from oscar_transformers.pytorch_transformers import AdamW, WarmupLinearSchedule, WarmupConstantSchedule
 from tensorboardX import SummaryWriter
-
+from oscar.utils.progressbar import ProgressBar
 
 
 class CaptionTSVDataset(Dataset):
@@ -379,12 +380,6 @@ def compute_score_with_logits(logits, labels):
 
 
 def train(args, train_dataloader, val_dataset, model, tokenizer, writer):
-    if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(
-            model, device_ids=[args.local_rank], 
-            output_device=args.local_rank,
-            find_unused_parameters=True,
-        )
 
     if args.max_steps > 0:
         t_total = args.max_steps
@@ -402,7 +397,42 @@ def train(args, train_dataloader, val_dataset, model, tokenizer, writer):
         {'params': [p for n, p in model.named_parameters() if \
             any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
     ]
-    optimizer = AdamW(grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
+    if args.amp:
+        from apex import amp
+        try:
+            # from apex.optimizers import FP16_Optimizer
+            #from pytorch_pretrained_bert.optimization_fp16 import FP16_Optimizer_State
+            from apex.optimizers import FusedAdam
+        except ImportError:
+            raise ImportError(
+                "Please install apex from https://www.github.com/nvidia/apex to use distributed and fp16 training.")
+
+        optimizer = FusedAdam(grouped_parameters,
+                              lr=args.learning_rate,
+                              eps=args.adam_epsilon,
+                              bias_correction=False)
+    else:
+        optimizer = AdamW(grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
+
+    if args.amp:
+        model, optimizer = amp.initialize(model, optimizer, opt_level='O2')#'02')
+
+
+    if args.distributed:
+        if args.amp:
+            try:
+                from apex.parallel import DistributedDataParallel as DDP 
+            except ImportError:
+                raise ImportError(
+                    'Please install apex from https://www.github.com/nvidia/apex to use distributed fp16 for training.')
+            model = DDP(model)#,delay_allreduce=True)
+        else:   
+            model = torch.nn.parallel.DistributedDataParallel(
+                model, device_ids=[args.local_rank], 
+                output_device=args.local_rank,
+                find_unused_parameters=True,
+            )
+
     if args.scheduler == "constant":
         scheduler = WarmupConstantSchedule(
                 optimizer, warmup_steps=args.warmup_steps)
@@ -440,6 +470,10 @@ def train(args, train_dataloader, val_dataset, model, tokenizer, writer):
     eval_log = []
     best_score = 0
     checkpoint_dir = None
+
+    if not args.distributed or args.local_rank == 0:
+        pbar = ProgressBar(n_total=len(train_dataloader), desc='Training')
+
     for epoch in range(int(args.num_train_epochs)):
         if args.distributed:
             train_dataloader.sampler.set_epoch(epoch)
@@ -485,10 +519,20 @@ def train(args, train_dataloader, val_dataset, model, tokenizer, writer):
 
             if args.gradient_accumulation_steps > 1:
                 loss = loss / args.gradient_accumulation_steps
-            loss.backward()
+
+            if args.amp:
+                with amp.scale_loss(loss, optimizer) as scaled_loss:
+                    scaled_loss.backward()
+            else:
+                loss.backward()
+                
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
             global_loss += loss.item()
             global_acc += batch_acc
+
+            if not args.distributed or args.local_rank == 0:
+                pbar(step)
+
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 global_step += 1
                 optimizer.step()
@@ -505,24 +549,14 @@ def train(args, train_dataloader, val_dataset, model, tokenizer, writer):
                         writer.add_scalar('batch_acc', batch_acc, global_step=global_step)
                         writer.add_scalar('lr', optimizer.param_groups[0]["lr"], global_step=global_step)
 
-                if (args.save_steps > 0 and global_step % args.save_steps == 0) or \
-                        global_step == t_total:
-                    checkpoint_dir = save_checkpoint(model, tokenizer, args, epoch, global_step, optimizer, scheduler) 
-                    # evaluation
-                    if args.evaluate_during_training:
-                        if not args.distributed or (args.local_rank==0): 
-                            logger.info("Perform evaluation at step: %d" % (global_step))
-                            evaluate(args, val_dataset, model, tokenizer,
-                                    checkpoint_dir, writer, global_step)
-                        # with open(evaluate_file, 'r') as f:
-                        #     res = json.load(f)
-                        # best_score = max(best_score, res['CIDEr'])
-                        # res['epoch'] = epoch
-                        # res['global_step'] = step
-                        # res['best_CIDEr'] = best_score
-                        # eval_log.append(res)
-                        # with open(args.output_dir + '/eval_logs.json', 'w') as f:
-                        #     json.dump(eval_log, f)
+        print()
+        checkpoint_dir = save_checkpoint(model, tokenizer, args, epoch, global_step, optimizer, scheduler) 
+        # evaluation
+        if args.evaluate_during_training:
+            if not args.distributed or (args.local_rank==0): 
+                logger.info("Perform evaluation at step: %d" % (global_step))
+                evaluate(args, val_dataset, model, tokenizer,
+                        checkpoint_dir, writer, global_step)       
     return checkpoint_dir
 
 
@@ -827,8 +861,8 @@ def main():
     parser.add_argument("--max_steps", default=-1, type=int, 
                         help="Total number of training steps. Override num_train_epochs.")
     parser.add_argument('--logging_steps', type=int, default=20, help="Log every X steps.")
-    parser.add_argument('--save_steps', type=int, default=-1, 
-                        help="Save checkpoint every X steps. Will also perform evaluatin.")
+    parser.add_argument('--save_epochs', type=int, default=1, 
+                        help="Save checkpoint every X epochs. Will also perform evaluatin.")
     parser.add_argument("--evaluate_during_training", action='store_true', 
                         help="Run evaluation during training at each save_steps.")
     parser.add_argument("--no_cuda", action='store_true', help="Avoid using CUDA.")
@@ -878,6 +912,8 @@ def main():
     parser.add_argument("--img_layer_norm_eps", default=1e-12, type=float,
                         help="The eps in image feature laynorm layer")
 
+    parser.add_argument('--amp', action='store_true',
+                        help="Whether to use amp for fp16")
     args = parser.parse_args()
 
     global logger
@@ -888,6 +924,9 @@ def main():
     args.num_gpus = get_world_size()
     args.distributed = args.num_gpus > 1
     args.device = torch.device('cuda')
+    if args.amp:
+        from apex import amp
+
     synchronize()
 
     output_dir = args.output_dir
