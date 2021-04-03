@@ -417,7 +417,6 @@ def train(args, train_dataloader, val_dataset, model, tokenizer, writer):
     if args.amp:
         model, optimizer = amp.initialize(model, optimizer, opt_level='O2')#'02')
 
-
     if args.distributed:
         if args.amp:
             try:
@@ -444,11 +443,14 @@ def train(args, train_dataloader, val_dataset, model, tokenizer, writer):
 
     # restore scheduler, optimizer
     if os.path.exists(op.join(args.model_name_or_path, 'epoch_step_opt_sc.bin')):
-        training_state = torch.load(op.join(args.model_name_or_path, 'epoch_step_opt_sc.bin'))
+        training_state = torch.load(op.join(args.model_name_or_path, 'epoch_step_opt_sc.bin'),
+            map_location=torch.device('cuda:{}'.format(args.local_rank)))
         optimizer.load_state_dict(training_state['optimizer'])
         scheduler.load_state_dict(training_state['scheduler'])
         logger.info("  Loading optimizer and scheduler from {}".format(op.join(args.model_name_or_path, 'epoch_step_opt_sc.bin')))
-
+        start_epoch = training_state['epoch']
+    else:
+        start_epoch = 0
     logger.info("***** Running training *****")
     logger.info("  Num Epochs = %d", args.num_train_epochs)
     logger.info("  Batch size per GPU = %d", args.per_gpu_train_batch_size)
@@ -474,7 +476,7 @@ def train(args, train_dataloader, val_dataset, model, tokenizer, writer):
     if not args.distributed or args.local_rank == 0:
         pbar = ProgressBar(n_total=len(train_dataloader), desc='Training')
 
-    for epoch in range(int(args.num_train_epochs)):
+    for epoch in range(start_epoch, int(args.num_train_epochs)):
 
         if epoch==0:
             checkpoint_dir = save_checkpoint(model, tokenizer, args, epoch, global_step, optimizer, scheduler)
@@ -933,7 +935,9 @@ def main():
     args.local_rank = local_rank
     args.num_gpus = get_world_size()
     args.distributed = args.num_gpus > 1
-    args.device = torch.device('cuda')
+    #args.device = torch.device('cuda')
+    torch.cuda.set_device(args.local_rank)
+    args.device = torch.device('cuda:{}'.format(args.local_rank))
     if args.amp:
         from apex import amp
 
