@@ -26,7 +26,19 @@ class BertHungarianLoss(torch.nn.Module):
         self.softmax = torch.nn.Softmax(dim=-1)
         self.whole_word = config.whole_word
 
-    def forward(self, logits, target, whole_word_masked=None, num_masked=None):
+    def is_acceptable(self, p, masked_pos, whole_word_masked):
+        lens = whole_word_masked[:,1]-whole_word_masked[:,0]
+        clen = 0
+        for i in p:
+            tag_len = lens[i]
+            #assert tag_len.shape==torch.Size([]),(tag_len, tag_len.shape)
+            assert masked_pos.dim()==1, masked_pos
+            if masked_pos[clen+tag_len-1]-masked_pos[clen]>=tag_len:
+                return False
+            clen += tag_len
+        return True
+
+    def forward(self, logits, target, whole_word_masked=None, num_masked=None, masked_pos=None, debug=False):
         #whole_word_masked
         #[[st,ed],[st,ed],[-1,-1],[-1,-1]]
         eps = self.label_smoothing
@@ -43,11 +55,21 @@ class BertHungarianLoss(torch.nn.Module):
         for p in permutations(range(0,M)): #assign target i to the p[i]-th predictions
             p = list(p)
             if self.whole_word:
+                if debug:
+                    print(p)
+                if not self.is_acceptable(p, masked_pos, whole_word_masked):
+                    if debug:
+                        print('unacceptable!')
+                    continue
+                if debug:
+                    print('is_acceptable!')
                 target_p = []
                 for i in p:
                     s, e = whole_word_masked[i][0],whole_word_masked[i][1]
                     target_p.append(target[s:e])
                 target_p = torch.cat(target_p, dim=0)
+                if debug:
+                    print('is_acceptable target:',target_p)
             else:
                 target_p = target[p] # num_masked
             C_ = torch.gather(prob,1,target_p.unsqueeze(1))  #num_masked, 1
@@ -97,14 +119,17 @@ class BertForVIVOPretraining(BertPreTrainedModel):
         for b in range(batch_size):
             one_sequence_output = sequence_output[b] #len_a, h
             one_masked_pos = masked_pos[b]
+            one_masked_pos_idx = torch.nonzero(one_masked_pos).squeeze(1)
             one_masked_ids = masked_ids[b][masked_ids[b]!=0]  #(nm,)  (num_masked,)
+            # if b==0:
+            #     print(one_masked_pos, one_masked_pos_idx)
 #             print(one_masked_pos)
 #             print(one_masked_ids)
 #             input()
             one_sequence_output_masked = one_sequence_output[one_masked_pos==1,:] #num_masked, h
             assert one_sequence_output_masked.shape[0] == one_masked_ids.shape[0]
             class_logits = self.cls(one_sequence_output_masked) # num_masked, h -> num_masked, V
-            one_loss, ids = self.loss(class_logits, one_masked_ids, whole_word_masked[b], num_masked_tags[b]) #scalar
+            one_loss, ids = self.loss(class_logits, one_masked_ids, whole_word_masked[b], num_masked_tags[b], one_masked_pos_idx,False) #scalar
             losses.append(one_loss) #num_masked,
             ranked_masked_ids.append(ids)
             class_logits_flatten.append(class_logits)

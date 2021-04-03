@@ -475,6 +475,16 @@ def train(args, train_dataloader, val_dataset, model, tokenizer, writer):
         pbar = ProgressBar(n_total=len(train_dataloader), desc='Training')
 
     for epoch in range(int(args.num_train_epochs)):
+
+        if epoch==0:
+            checkpoint_dir = save_checkpoint(model, tokenizer, args, epoch, global_step, optimizer, scheduler)
+            if args.evaluate_during_training:
+                if not args.distributed or (args.local_rank==0): 
+                    logger.info("Perform evaluation at step: %d" % (global_step))
+                    evaluate(args, val_dataset, model, tokenizer,
+                            checkpoint_dir, writer, global_step)
+
+
         if args.distributed:
             train_dataloader.sampler.set_epoch(epoch)
         for step, (img_keys, batch) in enumerate(train_dataloader):
@@ -498,11 +508,12 @@ def train(args, train_dataloader, val_dataset, model, tokenizer, writer):
                 # print('num_masked_tags', inputs['num_masked_tags'][0])
                 # print('whole_word_masked ', inputs['whole_word_masked'][0])
                 # print('input_ids\n',inputs['input_ids'][0])
-                # # #print('attention_mask\n',inputs['attention_mask'][0])
-                # # #print('token_type_ids\n',inputs['token_type_ids'][0])
-                # print('img_feats\n',inputs['img_feats'].shape)
+                # # # #print('attention_mask\n',inputs['attention_mask'][0])
+                # # # #print('token_type_ids\n',inputs['token_type_ids'][0])
+                # # print('img_feats\n',inputs['img_feats'].shape)
                 # print('masked_pos',inputs['masked_pos'][0])
                 # print('masked_ids',inputs['masked_ids'][0])
+                # input()
                 # 
                 #continue
                 # torch.set_printoptions(profile="default")
@@ -550,8 +561,7 @@ def train(args, train_dataloader, val_dataset, model, tokenizer, writer):
                         writer.add_scalar('lr', optimizer.param_groups[0]["lr"], global_step=global_step)
 
         print()
-        checkpoint_dir = save_checkpoint(model, tokenizer, args, epoch, global_step, optimizer, scheduler) 
-        # evaluation
+        checkpoint_dir = save_checkpoint(model, tokenizer, args, epoch, global_step, optimizer, scheduler)
         if args.evaluate_during_training:
             if not args.distributed or (args.local_rank==0): 
                 logger.info("Perform evaluation at step: %d" % (global_step))
