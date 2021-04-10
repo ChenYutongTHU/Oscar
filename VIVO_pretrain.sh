@@ -1,6 +1,6 @@
 export WORLD_SIZE="8"
-python3.6 -m torch.distributed.launch --nproc_per_node=8 oscar/run_VIVO_pretrain.py \
-    --model_name_or_path VIVO_output/pretrain_128_8_resume31_noloadoptim/checkpoint-32-53988.0 \
+python3.6 -m torch.distributed.launch --nproc_per_node=${WORLD_SIZE} oscar/run_VIVO_pretrain.py \
+    --model_name_or_path VIVO_output/pretrain_128_8_resume31_noloadoptim/checkpoint-38-63804.0 \
     --do_train \
     --do_lower_case \
     --add_od_labels \
@@ -9,8 +9,8 @@ python3.6 -m torch.distributed.launch --nproc_per_node=8 oscar/run_VIVO_pretrain
     --gradient_accumulation_steps 1 \
     --num_train_epochs 100 \
     --tie_weights \
-    --data_dir /data/private/NocapsData/VIVO_pretrain_data \
-    --num_workers 6 \
+    --data_dir /data/private/NocapsData/VIVO_pretrain_data_kara \
+    --num_workers 1 \
     --output_dir VIVO_output/pretrain_128_8_resume31_noloadoptim/ \
     --max_seq_length 17  --max_seq_a_length 17 --max_img_seq_length 50 \
     --mask_prob 0.15 --max_masked_tokens 3 \

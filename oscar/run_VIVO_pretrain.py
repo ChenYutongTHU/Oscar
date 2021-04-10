@@ -30,93 +30,72 @@ from oscar_transformers.pytorch_transformers import AdamW, WarmupLinearSchedule,
 from tensorboardX import SummaryWriter
 from oscar.utils.progressbar import ProgressBar
 
+import kara_storage
+import struct
 
-class CaptionTSVDataset(Dataset):
+class FeatureSerializer(kara_storage.serialization.Serializer):
+    def serialize(self, x):
+        num_box = x.shape[0]
+        return struct.pack("I", num_box) + x.tobytes()
+    
+    def deserialize(self, x):
+        import numpy as np
+        num_box = struct.unpack("I", x[:4])[0]
+        return np.frombuffer(x[4:], np.float32).reshape((num_box, -1))[:]
+
+def read_wrapper(x):
+    old_read = x.read
+    def nw_read():
+        v = old_read()
+        if v is None:
+            return None
+        return x.tell()-1, v
+    x.read = nw_read
+
+class CaptionKaraDataset(torch.utils.data.IterableDataset):
     def __init__(self, yaml_file, tokenizer=None, add_od_labels=True,
             max_img_seq_length=50, max_seq_length=70, max_seq_a_length=40, 
-            is_train=True, mask_prob=0.15, max_masked_tokens=3, whole_word=True, **kwargs):
-        """Constructor.
-        Args:
-            yaml file with all required data (image feature, caption, labels, etc)
-            tokenizer: tokenizer for text processing.
-            add_od_labels: whether to add labels from yaml file to BERT. 
-            max_img_seq_length: max image sequence length.
-            max_seq_length: max text sequence length.
-            max_seq_a_length: max caption sequence length.
-            is_train: train or test mode.
-            mask_prob: probability to mask a input token.
-            max_masked_tokens: maximum number of tokens to be masked in one sentence.
-            kwargs: other arguments.
-        """
+            is_train=True, mask_prob=0.15, max_masked_tokens=3, whole_word=True, **kwargs):  
         self.yaml_file = yaml_file
         self.cfg = load_from_yaml_file(yaml_file)
-        self.root = op.dirname(yaml_file)
-        self.label_file = find_file_path_in_yaml(self.cfg['label'], self.root)
-        self.feat_file = find_file_path_in_yaml(self.cfg['feature'], self.root)
 
-        assert op.isfile(self.feat_file)
-        if add_od_labels: assert op.isfile(self.label_file)
+        self.storage = kara_storage.KaraStorage(self.cfg['storage_path'])  
+        self.storage_open = self.storage.open(self.cfg['split0'], self.cfg['split1'], 
+            "r", serialization=FeatureSerializer())
+        read_wrapper(self.storage_open)
+        self.iterable_ImgDataset = kara_storage.make_torch_dataset(self.storage_open, shuffle=is_train)
+        #rint(self.cfg['storage_path'],self.cfg['split0'],self.cfg['split1'])
+        # self.iterable_ImgDataset.set_epoch(33)
+        # for it in self.iterable_ImgDataset:
+        #     print(it)
+        #     break
+        # input()
 
-        self.label_tsv = None if not self.label_file else TSVFile(self.label_file)
-        self.feat_tsv = TSVFile(self.feat_file)
+        with open(self.cfg['label_path'],'r') as f:
+            self.labels = json.load(f)
+        #load all labels at once
 
         self.tokenizer = tokenizer
         self.tensorizer = CaptionTensorizer(self.tokenizer, max_img_seq_length,
                 max_seq_length, mask_prob, max_masked_tokens, whole_word=whole_word,
                 is_train=is_train)
-        self.add_od_labels = add_od_labels
+
         self.is_train = is_train
         self.kwargs = kwargs
-        self.image_keys = self.prepare_image_keys()
-        self.key2index = self.prepare_image_key_to_index()
 
-    def get_valid_tsv(self):
-        # based on the order of file size
-        if self.label_tsv:
-            return self.label_tsv
-        if self.feat_tsv:
-            return self.feat_tsv
+    def __iter__(self):
+        for img in self.iterable_ImgDataset:
+            index, features = img[0], img[1]
+            img_id, od_labels = self.labels[index]
+            example = self.tensorizer.tensorize_example(od_labels, torch.Tensor(features))
+            yield img_id, example
 
-    def prepare_image_keys(self):
-        tsv = self.get_valid_tsv()
-        return [tsv.seek(i)[0] for i in range(tsv.num_rows())]
-
-    def prepare_image_key_to_index(self):
-        tsv = self.get_valid_tsv()
-        return {tsv.seek(i)[0] : i for i in range(tsv.num_rows())}
-
-    def get_image_index(self, idx):
-        return idx
-
-    def get_image_key(self, idx):
-        img_idx = self.get_image_index(idx)
-        return self.image_keys[img_idx]
-
-    def get_image_features(self, img_idx):
-        num_boxes = int(self.feat_tsv.seek(img_idx)[1])
-        features = np.frombuffer(base64.b64decode(self.feat_tsv.seek(img_idx)[2]), np.float32
-                ).reshape((num_boxes, -1))[:]
-        return torch.Tensor(np.array(features))
-
-    def get_od_labels(self, img_idx):
-        od_labels = None
-        if self.add_od_labels:
-            label_info = json.loads(self.label_tsv.seek(img_idx)[1])
-            #od_labels = " ".join([l['class'] for l in label_info])
-            od_labels = [l['class'] for l in label_info]
-        return od_labels
-
-    def __getitem__(self, idx):
-        img_idx = self.get_image_index(idx)
-        img_key = self.image_keys[img_idx]
-        features = self.get_image_features(idx)
-        od_labels = self.get_od_labels(idx)
-        example = self.tensorizer.tensorize_example(od_labels, features)
-        return img_key, example
+    def set_epoch(self, epoch):
+        self.iterable_ImgDataset.set_epoch(epoch)
 
     def __len__(self):
-        return self.get_valid_tsv().num_rows()
-
+        n_gpu = get_world_size()
+        return len(self.labels)//n_gpu
 
 class CaptionTensorizer(object):
     def __init__(self, tokenizer, max_img_seq_length=50, max_seq_length=70, 
@@ -297,13 +276,13 @@ def build_dataset(yaml_file, tokenizer, args, is_train=True):
         assert op.isfile(yaml_file)
 
     if is_train:
-        return CaptionTSVDataset(yaml_file, tokenizer=tokenizer,
+        return CaptionKaraDataset(yaml_file, tokenizer=tokenizer,
             add_od_labels=args.add_od_labels, max_img_seq_length=args.max_img_seq_length,
             max_seq_length=args.max_seq_length, max_seq_a_length=args.max_seq_a_length,
             is_train=True, mask_prob=args.mask_prob, max_masked_tokens=args.max_masked_tokens,
             whole_word=args.whole_word)
     
-    return CaptionTSVDataset(yaml_file, tokenizer=tokenizer,
+    return CaptionKaraDataset(yaml_file, tokenizer=tokenizer,
             add_od_labels=args.add_od_labels, max_img_seq_length=args.max_img_seq_length,
             max_seq_length=args.max_seq_length, max_seq_a_length=args.max_seq_a_length,
             is_train=False, mask_prob=args.mask_prob, max_masked_tokens=args.max_masked_tokens,
@@ -337,9 +316,9 @@ def make_data_loader(args, yaml_file, tokenizer, is_distributed=True,
         shuffle = False
         images_per_gpu = args.per_gpu_eval_batch_size
 
-    sampler = make_data_sampler(dataset, shuffle, is_distributed)
+    #sampler = make_data_sampler(dataset, shuffle, is_distributed)
     data_loader = torch.utils.data.DataLoader(
-        dataset, num_workers=args.num_workers, sampler=sampler,
+        dataset, num_workers=args.num_workers, 
         batch_size=images_per_gpu,
         pin_memory=True,
     )
@@ -492,7 +471,7 @@ def train(args, train_dataloader, val_dataset, model, tokenizer, writer):
 
 
         if args.distributed:
-            train_dataloader.sampler.set_epoch(epoch)
+            train_dataloader.dataset.set_epoch(epoch)
         for step, (img_keys, batch) in enumerate(train_dataloader):
             tags = batch[-1]
             batch = tuple(t.to(args.device) for t in batch[:-1])
@@ -508,21 +487,23 @@ def train(args, train_dataloader, val_dataset, model, tokenizer, writer):
                 }
 
                #  debug
-                torch.set_printoptions(profile="full")
+                #torch.set_printoptions(profile="full")
                 #print('input_ids shape ', batch[0].shape)
                 # print('tag ', tags[0])
+                # print(img_keys[0])
                 # print('num_masked_tags', inputs['num_masked_tags'][0])
                 # print('whole_word_masked ', inputs['whole_word_masked'][0])
                 # print('input_ids\n',inputs['input_ids'][0])
-                # # # #print('attention_mask\n',inputs['attention_mask'][0])
-                # # # #print('token_type_ids\n',inputs['token_type_ids'][0])
-                # # print('img_feats\n',inputs['img_feats'].shape)
+                # # # # #print('attention_mask\n',inputs['attention_mask'][0])
+                # # # # #print('token_type_ids\n',inputs['token_type_ids'][0])
+                # # # print('img_feats\n',inputs['img_feats'].shape)
                 # print('masked_pos',inputs['masked_pos'][0])
                 # print('masked_ids',inputs['masked_ids'][0])
+                # torch.set_printoptions(profile="default")
+                # print('img_feats\n',inputs['img_feats'][0])
                 # input()
                 # 
                 #continue
-                # torch.set_printoptions(profile="default")
                 
                 outputs = model(**inputs)
                 loss, logits, ranked_masked_ids = outputs[:3]
