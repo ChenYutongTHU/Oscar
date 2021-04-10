@@ -445,10 +445,14 @@ def train(args, train_dataloader, val_dataset, model, tokenizer, writer):
     if os.path.exists(op.join(args.model_name_or_path, 'epoch_step_opt_sc.bin')):
         training_state = torch.load(op.join(args.model_name_or_path, 'epoch_step_opt_sc.bin'),
             map_location=torch.device('cuda:{}'.format(args.local_rank)))
-        optimizer.load_state_dict(training_state['optimizer'])
+        if args.load_optimizer:
+            optimizer.load_state_dict(training_state['optimizer'])
         scheduler.load_state_dict(training_state['scheduler'])
-        logger.info("  Loading optimizer and scheduler from {}".format(op.join(args.model_name_or_path, 'epoch_step_opt_sc.bin')))
-        start_epoch = training_state['epoch']
+        if args.load_optimizer:
+            logger.info("  Loading optimizer and scheduler from {}".format(op.join(args.model_name_or_path, 'epoch_step_opt_sc.bin')))
+        else:
+            logger.info("  Loading scheduler from {}".format(op.join(args.model_name_or_path, 'epoch_step_opt_sc.bin')))
+        start_epoch = training_state['epoch']+1
     else:
         start_epoch = 0
     logger.info("***** Running training *****")
@@ -467,7 +471,7 @@ def train(args, train_dataloader, val_dataset, model, tokenizer, writer):
         logger.info("  SCST training...")
 
 
-    global_step, global_loss, global_acc =0,  0.0, 0.0
+    global_step, global_loss, global_acc = start_epoch*t_total/args.num_train_epochs,  0.0, 0.0
     model.zero_grad()
     eval_log = []
     best_score = 0
@@ -552,11 +556,10 @@ def train(args, train_dataloader, val_dataset, model, tokenizer, writer):
                 scheduler.step()
                 model.zero_grad()
                 if global_step % args.logging_steps == 0:
-                    logger.info("Epoch: {}, global_step: {}, lr: {:.6f}, loss: {:.4f} ({:.4f}), " \
-                        "score: {:.4f} ({:.4f})".format(epoch, global_step, 
-                        optimizer.param_groups[0]["lr"], loss, global_loss / global_step, 
-                        batch_acc, global_acc / global_step)
-                    )
+                    logger.info("Epoch: {}, global_step: {}, lr: {:.6f}, loss: {:.4f}, " \
+                        "score: {:.4f}".format(epoch, global_step, 
+                        optimizer.param_groups[0]["lr"], loss, 
+                        batch_acc))
                     if writer != None:
                         writer.add_scalar('loss', loss, global_step=global_step)
                         writer.add_scalar('batch_acc', batch_acc, global_step=global_step)
@@ -926,6 +929,7 @@ def main():
 
     parser.add_argument('--amp', action='store_true',
                         help="Whether to use amp for fp16")
+    parser.add_argument('--load_optimizer', action='store_true', help='whether to load optimizer')
     args = parser.parse_args()
 
     global logger
