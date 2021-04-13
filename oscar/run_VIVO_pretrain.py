@@ -461,17 +461,19 @@ def train(args, train_dataloader, val_dataset, model, tokenizer, writer):
 
     for epoch in range(start_epoch, int(args.num_train_epochs)):
 
-        if epoch==0:
+        if epoch==start_epoch:
             checkpoint_dir = save_checkpoint(model, tokenizer, args, epoch, global_step, optimizer, scheduler)
             if args.evaluate_during_training:
                 if not args.distributed or (args.local_rank==0): 
                     logger.info("Perform evaluation at step: %d" % (global_step))
+                    val_dataset.dataset.set_epoch(epoch)
                     evaluate(args, val_dataset, model, tokenizer,
                             checkpoint_dir, writer, global_step)
 
 
-        if args.distributed:
-            train_dataloader.dataset.set_epoch(epoch)
+        # if args.distributed:
+        train_dataloader.dataset.set_epoch(epoch)
+        val_dataset.dataset.set_epoch(epoch)
         for step, (img_keys, batch) in enumerate(train_dataloader):
             tags = batch[-1]
             batch = tuple(t.to(args.device) for t in batch[:-1])
