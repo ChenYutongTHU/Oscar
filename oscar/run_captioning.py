@@ -24,202 +24,72 @@ from oscar.utils.cbs import FiniteStateMachineBuilder
 from oscar.modeling.modeling_bert import BertForImageCaptioning
 from transformers.pytorch_transformers import BertTokenizer, BertConfig
 from transformers.pytorch_transformers import AdamW, WarmupLinearSchedule, WarmupConstantSchedule
+from tensorboardX import SummaryWriter
+from oscar.utils.progressbar import ProgressBar
+import kara_storage
+import struct
 
+class FeatureSerializer(kara_storage.serialization.Serializer):
+    def serialize(self, x):
+        num_box = x.shape[0]
+        return struct.pack("I", num_box) + x.tobytes()
+    
+    def deserialize(self, x):
+        import numpy as np
+        num_box = struct.unpack("I", x[:4])[0]
+        return np.frombuffer(x[4:], np.float32).reshape((num_box, -1))[:]
 
-class CaptionTSVDataset(Dataset):
+def read_wrapper(x):
+    old_read = x.read
+    def nw_read():
+        v = old_read()
+        if v is None:
+            return None
+        return x.tell()-1, v
+    x.read = nw_read
+
+class CaptionKaraDataset(torch.utils.data.IterableDataset):
     def __init__(self, yaml_file, tokenizer=None, add_od_labels=True,
             max_img_seq_length=50, max_seq_length=70, max_seq_a_length=40, 
             is_train=True, mask_prob=0.15, max_masked_tokens=3, **kwargs):
-        """Constructor.
-        Args:
-            yaml file with all required data (image feature, caption, labels, etc)
-            tokenizer: tokenizer for text processing.
-            add_od_labels: whether to add labels from yaml file to BERT. 
-            max_img_seq_length: max image sequence length.
-            max_seq_length: max text sequence length.
-            max_seq_a_length: max caption sequence length.
-            is_train: train or test mode.
-            mask_prob: probability to mask a input token.
-            max_masked_tokens: maximum number of tokens to be masked in one sentence.
-            kwargs: other arguments.
-        """
         self.yaml_file = yaml_file
         self.cfg = load_from_yaml_file(yaml_file)
-        self.root = op.dirname(yaml_file)
-        self.label_file = find_file_path_in_yaml(self.cfg['label'], self.root)
-        self.feat_file = find_file_path_in_yaml(self.cfg['feature'], self.root)
-        self.caption_file = find_file_path_in_yaml(self.cfg.get('caption'), self.root)
-
-        assert op.isfile(self.feat_file)
-        if add_od_labels: assert op.isfile(self.label_file)
-        if is_train: assert op.isfile(self.caption_file) and tokenizer is not None
-
-        self.label_tsv = None if not self.label_file else TSVFile(self.label_file)
-        self.feat_tsv = TSVFile(self.feat_file)
-        self.captions = []
-        if self.caption_file and op.isfile(self.caption_file):
-            with open(self.caption_file, 'r') as f:
-                self.captions = json.load(f)
-
+        self.storage = kara_storage.KaraStorage(self.cfg['storage_path'])  
+        self.storage_open = self.storage.open(self.cfg['split0'], self.cfg['split1'], 
+            "r", serialization=FeatureSerializer())
+        read_wrapper(self.storage_open)
+        self.iterable_ImgDataset = kara_storage.make_torch_dataset(self.storage_open, shuffle=is_train)
+        with open(self.cfg['label_path'],'r') as f:
+            self.labels = json.load(f)  #[id,[labels]], [id, [labels],[id,[labels]]]
+        with open(self.cfg['caption_path'],'r') as f:
+            self.captions = json.load(f)
         self.tokenizer = tokenizer
         self.tensorizer = CaptionTensorizer(self.tokenizer, max_img_seq_length,
-                max_seq_length, max_seq_a_length, mask_prob, max_masked_tokens,
-                is_train=is_train)
-        self.add_od_labels = add_od_labels
+                max_seq_length, max_seq_a_length, mask_prob, max_masked_tokens, is_train=is_train)
+
         self.is_train = is_train
         self.kwargs = kwargs
-        self.image_keys = self.prepare_image_keys()
-        self.key2index = self.prepare_image_key_to_index()
-        self.key2captions = self.prepare_image_key_to_captions()
 
-    def get_valid_tsv(self):
-        # based on the order of file size
-        if self.label_tsv:
-            return self.label_tsv
-        if self.feat_tsv:
-            return self.feat_tsv
+    def __iter__(self):
+        for img in self.iterable_ImgDataset:
+            index, features = img[0], img[1]
+            img_id, od_labels = self.labels[index]
+            img_id, caps = self.captions[index]
+            example = self.tensorizer.tensorize_example(text_a=caps, text_b=od_labels, torch.Tensor(features))
+            yield img_id, example
 
-    def prepare_image_keys(self):
-        tsv = self.get_valid_tsv()
-        return [tsv.seek(i)[0] for i in range(tsv.num_rows())]
-
-    def prepare_image_key_to_index(self):
-        tsv = self.get_valid_tsv()
-        return {tsv.seek(i)[0] : i for i in range(tsv.num_rows())}
-
-    def prepare_image_key_to_captions(self):
-        if self.captions:
-            key2captions = {key: [] for key in self.image_keys}
-            for cap in self.captions:
-                key2captions[cap['image_id']].append(cap['caption'])
-            return key2captions
-
-    def get_image_index(self, idx):
-        if self.is_train:
-            img_cap_pair = self.captions[idx]
-            img_key = img_cap_pair['image_id']
-            return self.key2index[img_key]
-        return idx
-
-    def get_image_key(self, idx):
-        img_idx = self.get_image_index(idx)
-        return self.image_keys[img_idx]
-
-    def get_image_features(self, img_idx):
-        feat_info = json.loads(self.feat_tsv.seek(img_idx)[1])
-        num_boxes = feat_info['num_boxes']
-        features = np.frombuffer(base64.b64decode(feat_info['features']), np.float32
-                ).reshape((num_boxes, -1))
-        return torch.Tensor(features)
-
-    def get_caption(self, idx):
-        if self.is_train:
-            img_cap_pair = self.captions[idx]
-            return img_cap_pair['caption']
-        return ""
-
-    def get_od_labels(self, img_idx):
-        od_labels = None
-        if self.add_od_labels:
-            label_info = json.loads(self.label_tsv.seek(img_idx)[1])
-            od_labels = " ".join([l['class'] for l in label_info])
-        return od_labels
-
-    def get_caption_file_in_coco_format(self):
-        cap_file = op.splitext(self.caption_file)[0] + '_coco_format.json'
-        return cap_file
-
-    def get_captions_by_key(self, key):
-        return self.key2captions[key]
-
-    def __getitem__(self, idx):
-        img_idx = self.get_image_index(idx)
-        img_key = self.image_keys[img_idx]
-        features = self.get_image_features(img_idx)
-        caption = self.get_caption(idx)
-        od_labels = self.get_od_labels(img_idx)
-        example = self.tensorizer.tensorize_example(caption, features, text_b=od_labels)
-        return img_key, example
+    def set_epoch(self, epoch):
+        self.iterable_ImgDataset.set_epoch(epoch)
 
     def __len__(self):
-        if self.is_train:
-            return len(self.captions)
-        return self.get_valid_tsv().num_rows()
-
-
-class CaptionTSVDatasetWithConstraints(CaptionTSVDataset):
-    r"""
-    Providing inputs for inference with Constraint Beam Search
-
-    nms_threshold: float, optional (default = 0.85)
-        NMS threshold for suppressing generic object class names during constraint filtering,
-        for two boxes with IoU higher than this threshold, "dog" suppresses "animal".
-    max_given_constraints: int, optional (default = 3)
-        Maximum number of constraints which can be specified for CBS decoding. Constraints are
-        selected based on the prediction confidence score of their corresponding bounding boxes.
-    """
-
-    def __init__(
-        self, yaml_file,
-        nms_threshold=0.85,
-        max_given_constraints=3, **kwargs
-    ):
-        super().__init__(yaml_file, **kwargs)
-        boxes_tsvpath = find_file_path_in_yaml(self.cfg['cbs_box'], self.root)
-        constraint2tokens_tsvpath = find_file_path_in_yaml(self.cfg['cbs_constraint'], self.root)
-        tokenforms_tsvpath = find_file_path_in_yaml(self.cfg['cbs_tokenforms'], self.root)
-        hierarchy_jsonpath = find_file_path_in_yaml(self.cfg['cbs_hierarchy'], self.root)
-
-        self._boxes_reader = ConstraintBoxesReader(boxes_tsvpath)
-        self._constraint_filter = ConstraintFilter(
-            hierarchy_jsonpath, nms_threshold, max_given_constraints
-        )
-        self._fsm_builder = FiniteStateMachineBuilder(self.tokenizer,
-                constraint2tokens_tsvpath, tokenforms_tsvpath,
-                max_given_constraints)
-
-    def __getitem__(self, index):
-        img_key, example = super().__getitem__(index)
-
-        # Apply constraint filtering to object class names.
-        constraint_boxes = self._boxes_reader[img_key]
-
-        candidates = self._constraint_filter(
-            constraint_boxes["boxes"], constraint_boxes["class_names"], constraint_boxes["scores"]
-        )
-        num_constraints = len(candidates)
-        fsm, nstates = self._fsm_builder.build(candidates)
-
-        return img_key, example + (fsm, num_constraints, )
-
+        n_gpu = get_world_size()
+        return len(self.labels)//n_gpu
 
 class CaptionTensorizer(object):
-    def __init__(self, tokenizer, max_img_seq_length=50, max_seq_length=70, 
-            max_seq_a_length=40, mask_prob=0.15, max_masked_tokens=3,
-            is_train=True):
-        """Constructor.
-        Args:
-            tokenizer: tokenizer for text processing.
-            max_img_seq_length: max image sequence length.
-            max_seq_length: max text sequence length.
-            max_seq_a_length: max caption sequence length.
-            is_train: train or test mode.
-            mask_prob: probability to mask a input token.
-            max_masked_tokens: maximum number of tokens to be masked in one sentence.
-        """
-        self.tokenizer = tokenizer
-        self.is_train = is_train
-        self.max_img_seq_len = max_img_seq_length
-        self.max_seq_len = max_seq_length
-        self.max_seq_a_len = max_seq_a_length
-        self.mask_prob = mask_prob
-        self.max_masked_tokens = max_masked_tokens
-        self._triangle_mask = torch.tril(torch.ones((self.max_seq_len, 
-            self.max_seq_len), dtype=torch.long))
-
-    def tensorize_example(self, text_a, img_feat, text_b=None,
-            cls_token_segment_id=0, pad_token_segment_id=0,
-            sequence_a_segment_id=0, sequence_b_segment_id=1):
+    def __init__(self,):
+        pass
+    def tensorize_example(self, text_a, text_b, img_feat,  #a caption; b tag
+            cls_token_segment_id=0, pad_token_segment_id=0, sequence_a_segment_id=0, sequence_b_segment_id=1):
         if self.is_train:
             tokens_a = self.tokenizer.tokenize(text_a)
         else:
@@ -227,23 +97,21 @@ class CaptionTensorizer(object):
             tokens_a = [self.tokenizer.mask_token] * (self.max_seq_a_len - 2)
         if len(tokens_a) > self.max_seq_a_len - 2:
             tokens_a = tokens_a[:(self.max_seq_a_len - 2)]
-
         tokens = [self.tokenizer.cls_token] + tokens_a + [self.tokenizer.sep_token]
         segment_ids = [cls_token_segment_id] + [sequence_a_segment_id] * (len(tokens) - 1)
         seq_a_len = len(tokens)
-        if text_b:
-            # pad text_a to keep it in fixed length for better inference.
-            padding_a_len = self.max_seq_a_len - seq_a_len
-            tokens += [self.tokenizer.pad_token] * padding_a_len
-            segment_ids += ([pad_token_segment_id] * padding_a_len)
+        padding_a_len = self.max_seq_a_len - seq_a_len
+        tokens += [self.tokenizer.pad_token] * padding_a_len
+        segment_ids += ([pad_token_segment_id] * padding_a_len)
 
-            tokens_b = self.tokenizer.tokenize(text_b)
-            if len(tokens_b) > self.max_seq_len - len(tokens) - 1:
-                tokens_b = tokens_b[: (self.max_seq_len - len(tokens) - 1)]
-            tokens += tokens_b + [self.tokenizer.sep_token]
-            segment_ids += [sequence_b_segment_id] * (len(tokens_b) + 1)
-
+        text_b = ' '.join(text_b)
+        tokens_b = self.tokenizer.tokenize(text_b)
+        if len(tokens_b) > self.max_seq_len - len(tokens) - 1:
+            tokens_b = tokens_b[: (self.max_seq_len - len(tokens) - 1)]
+        tokens += tokens_b + [self.tokenizer.sep_token]
+        segment_ids += [sequence_b_segment_id] * (len(tokens_b) + 1)
         seq_len = len(tokens)
+
         if self.is_train:
             masked_pos = torch.zeros(self.max_seq_len, dtype=torch.int)
             # randomly mask words for prediction, ignore [CLS]
@@ -293,10 +161,6 @@ class CaptionTensorizer(object):
                                           img_feat.shape[1]))
             img_feat = torch.cat((img_feat, padding_matrix), 0)
 
-        # prepare attention mask:
-        # note that there is no attention from caption to image
-        # because otherwise it will violate the triangle attention 
-        # for caption as caption will have full attention on image. 
         max_len = self.max_seq_len + self.max_img_seq_len
         attention_mask = torch.zeros((max_len, max_len), dtype=torch.long)
         # C: caption, L: label, R: image region
@@ -324,20 +188,69 @@ class CaptionTensorizer(object):
         return (input_ids, attention_mask, segment_ids, img_feat, masked_pos)
 
 
+class CaptionTSVDatasetWithConstraints(CaptionTSVDataset):
+    r"""
+    Providing inputs for inference with Constraint Beam Search
+
+    nms_threshold: float, optional (default = 0.85)
+        NMS threshold for suppressing generic object class names during constraint filtering,
+        for two boxes with IoU higher than this threshold, "dog" suppresses "animal".
+    max_given_constraints: int, optional (default = 3)
+        Maximum number of constraints which can be specified for CBS decoding. Constraints are
+        selected based on the prediction confidence score of their corresponding bounding boxes.
+    """
+
+    def __init__(
+        self, yaml_file,
+        nms_threshold=0.85,
+        max_given_constraints=3, **kwargs
+    ):
+        super().__init__(yaml_file, **kwargs)
+        boxes_tsvpath = find_file_path_in_yaml(self.cfg['cbs_box'], self.root)
+        constraint2tokens_tsvpath = find_file_path_in_yaml(self.cfg['cbs_constraint'], self.root)
+        tokenforms_tsvpath = find_file_path_in_yaml(self.cfg['cbs_tokenforms'], self.root)
+        hierarchy_jsonpath = find_file_path_in_yaml(self.cfg['cbs_hierarchy'], self.root)
+
+        self._boxes_reader = ConstraintBoxesReader(boxes_tsvpath)
+        self._constraint_filter = ConstraintFilter(
+            hierarchy_jsonpath, nms_threshold, max_given_constraints
+        )
+        self._fsm_builder = FiniteStateMachineBuilder(self.tokenizer,
+                constraint2tokens_tsvpath, tokenforms_tsvpath,
+                max_given_constraints)
+
+    def __getitem__(self, index):
+        img_key, example = super().__getitem__(index)
+
+        # Apply constraint filtering to object class names.
+        constraint_boxes = self._boxes_reader[img_key]
+
+        candidates = self._constraint_filter(
+            constraint_boxes["boxes"], constraint_boxes["class_names"], constraint_boxes["scores"]
+        )
+        num_constraints = len(candidates)
+        fsm, nstates = self._fsm_builder.build(candidates)
+
+        return img_key, example + (fsm, num_constraints, )
+
+
+
+
 def build_dataset(yaml_file, tokenizer, args, is_train=True):
     if not op.isfile(yaml_file):
         yaml_file = op.join(args.data_dir, yaml_file)
         assert op.isfile(yaml_file)
 
     if is_train:
-        return CaptionTSVDataset(yaml_file, tokenizer=tokenizer,
+        return CaptionKaraDataset(yaml_file, tokenizer=tokenizer,
             add_od_labels=args.add_od_labels, max_img_seq_length=args.max_img_seq_length,
             max_seq_length=args.max_seq_length, max_seq_a_length=args.max_seq_a_length,
             is_train=True, mask_prob=args.mask_prob, max_masked_tokens=args.max_masked_tokens)
     if args.use_cbs:
+        assert args.use_cbs==False, 'not support CBS dataloader now'
         dataset_class = CaptionTSVDatasetWithConstraints
     else:
-        dataset_class = CaptionTSVDataset
+        dataset_class = CaptionKaraDataset
     return dataset_class(yaml_file, tokenizer=tokenizer,
             add_od_labels=args.add_od_labels, max_img_seq_length=args.max_img_seq_length,
             max_seq_length=args.max_seq_length, max_seq_a_length=args.max_gen_length,
@@ -371,9 +284,9 @@ def make_data_loader(args, yaml_file, tokenizer, is_distributed=True,
         shuffle = False
         images_per_gpu = args.per_gpu_eval_batch_size
 
-    sampler = make_data_sampler(dataset, shuffle, is_distributed)
+    #sampler = make_data_sampler(dataset, shuffle, is_distributed)
     data_loader = torch.utils.data.DataLoader(
-        dataset, num_workers=args.num_workers, sampler=sampler,
+        dataset, num_workers=args.num_workers, 
         batch_size=images_per_gpu,
         pin_memory=True,
     )
@@ -876,8 +789,8 @@ def main():
     parser.add_argument("--max_steps", default=-1, type=int, 
                         help="Total number of training steps. Override num_train_epochs.")
     parser.add_argument('--logging_steps', type=int, default=20, help="Log every X steps.")
-    parser.add_argument('--save_steps', type=int, default=-1, 
-                        help="Save checkpoint every X steps. Will also perform evaluatin.")
+    parser.add_argument('--save_epochs', type=int, default=1, 
+                        help="Save checkpoint every X epochs. Will also perform evaluatin.")
     parser.add_argument("--evaluate_during_training", action='store_true', 
                         help="Run evaluation during training at each save_steps.")
     parser.add_argument("--no_cuda", action='store_true', help="Avoid using CUDA.")
@@ -921,6 +834,10 @@ def main():
                         help='Use constrained beam search for decoding')
     parser.add_argument('--min_constraints_to_satisfy', type=int, default=2,
                         help="minimum number of constraints to satisfy")
+    parser.add_argument('--amp', action='store_true',
+                        help="Whether to use amp for fp16")
+    parser.add_argument('--load_optimizer', action='store_true', help='whether to load optimizer')
+
     args = parser.parse_args()
 
     global logger
@@ -930,13 +847,16 @@ def main():
     args.local_rank = local_rank
     args.num_gpus = get_world_size()
     args.distributed = args.num_gpus > 1
-    args.device = torch.device('cuda')
+    torch.cuda.set_device(args.local_rank)
+    args.device = torch.device('cuda:{}'.format(args.local_rank))
+    if args.amp:
+        from apex import amp
     synchronize()
 
     output_dir = args.output_dir
     mkdir(output_dir)
 
-    logger = setup_logger("vlpretrain", output_dir, args.local_rank)
+    logger = setup_logger("coco_finetune", output_dir, args.local_rank)
     logger.warning("Device: %s, n_gpu: %s", args.device, args.num_gpus)
     set_seed(args.seed, args.num_gpus)
     args = restore_training_settings(args)
