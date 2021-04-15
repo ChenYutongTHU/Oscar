@@ -102,6 +102,16 @@ class BertForVIVOPretraining(BertPreTrainedModel):
             freeze = self.config.freeze_embedding
         self.bert.embeddings.word_embeddings.weight.requires_grad = not freeze
 
+    def compute_embeddings(self, input_ids, img_feats, attention_mask, masked_pos=None, 
+            whole_word_masked=None, num_masked_tags=None, masked_ids=None, 
+            token_type_ids=None, position_ids=None, head_mask=None):
+        outputs = self.bert(input_ids, img_feats=img_feats, attention_mask=attention_mask, 
+            position_ids=position_ids, token_type_ids=token_type_ids,
+            head_mask=head_mask,
+            encoder_history_states=None)
+
+        return outputs[0] # last layer hidden states
+
     def forward(self, input_ids, img_feats, attention_mask, masked_pos, 
             whole_word_masked=None, num_masked_tags=None, masked_ids=None, 
             token_type_ids=None, position_ids=None, head_mask=None):
