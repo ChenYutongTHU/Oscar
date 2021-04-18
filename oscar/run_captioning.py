@@ -474,6 +474,7 @@ def train(args, train_dataloader, val_dataset, model, tokenizer, writer):
                     eval_log[name].append(res)
                     with open(args.output_dir + '/eval_logs_{}_{}.json'.format(name, epoch), 'w') as f:
                         json.dump(eval_log[name], f)
+                    val_dataset[name].dataset.set_epoch(epoch)
         if get_world_size() > 1:
             torch.distributed.barrier()
 
@@ -540,7 +541,7 @@ def train(args, train_dataloader, val_dataset, model, tokenizer, writer):
                 optimizer, scheduler, num_trial=10)
         # evaluation
 
-        if args.evaluate_during_training: 
+        if args.evaluate_during_training and is_main_process(): 
             for name in val_dataset:
                 logger.info(name+": Perform evaluation at step: %d epoch %d" % (global_step, epoch))
                 evaluate_file = evaluate(args, val_dataset[name], model, tokenizer,
