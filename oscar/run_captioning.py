@@ -10,7 +10,8 @@ import torch
 import torch.distributed as dist
 from torch.utils.data import Dataset
 from tqdm import tqdm
-
+import sys
+sys.path.append('/data/private/chenyutong/Oscar')
 from oscar.utils.logger import setup_logger
 from oscar.utils.tsv_file import TSVFile
 from oscar.utils.tsv_file_ops import (tsv_writer, concat_tsv_files,
@@ -22,8 +23,8 @@ from oscar.utils.caption_evaluate import (evaluate_on_coco_caption,
 from oscar.utils.cbs import ConstraintFilter, ConstraintBoxesReader
 from oscar.utils.cbs import FiniteStateMachineBuilder
 from oscar.modeling.modeling_bert import BertForImageCaptioning
-from transformers.pytorch_transformers import BertTokenizer, BertConfig
-from transformers.pytorch_transformers import AdamW, WarmupLinearSchedule, WarmupConstantSchedule
+from oscar_transformers.pytorch_transformers import BertTokenizer, BertConfig
+from oscar_transformers.pytorch_transformers import AdamW, WarmupLinearSchedule, WarmupConstantSchedule
 from tensorboardX import SummaryWriter
 from oscar.utils.progressbar import ProgressBar
 import kara_storage
@@ -59,8 +60,12 @@ class CaptionKaraDataset(torch.utils.data.IterableDataset):
             "r", serialization=FeatureSerializer())
         read_wrapper(self.storage_open)
         self.iterable_ImgDataset = kara_storage.make_torch_dataset(self.storage_open, shuffle=is_train)
+
+        #print(len(self.iterable_ImgDataset))
         with open(self.cfg['label_path'],'r') as f:
             self.labels = json.load(f)  #[id,[labels]], [id, [labels],[id,[labels]]]
+        # print('labels',len(self.labels))
+        # input()
         with open(self.cfg['caption_path'],'r') as f:
             self.captions = json.load(f)
         self.tokenizer = tokenizer
@@ -73,23 +78,43 @@ class CaptionKaraDataset(torch.utils.data.IterableDataset):
     def __iter__(self):
         for img in self.iterable_ImgDataset:
             index, features = img[0], img[1]
+            assert index < len(self.labels), (index, len(self.labels), len(self.iterable_ImgDataset))
             img_id, od_labels = self.labels[index]
             img_id, caps = self.captions[index]
-            example = self.tensorizer.tensorize_example(text_a=caps, text_b=od_labels, torch.Tensor(features))
+            example = self.tensorizer.tensorize_example(text_a=caps, text_b=od_labels, img_feat=torch.Tensor(features),
+                sequence_a_segment_id=1, sequence_b_segment_id=0)  #tag -> 0 caption -> 1
             yield img_id, example
 
     def set_epoch(self, epoch):
         self.iterable_ImgDataset.set_epoch(epoch)
+
+    def get_caption_file_in_coco_format(self):
+        assert self.is_train==False
+        cap_file = op.splitext(self.cfg['caption_path'])[0] + '_coco_format.json' #root
+        return cap_file
 
     def __len__(self):
         n_gpu = get_world_size()
         return len(self.labels)//n_gpu
 
 class CaptionTensorizer(object):
-    def __init__(self,):
-        pass
+    def __init__(self, tokenizer, max_img_seq_length=50, max_seq_length=70, 
+        max_seq_a_length=40, mask_prob=0.15, max_masked_tokens=3, is_train=True):
+        self.tokenizer = tokenizer
+        self.is_train = is_train
+        self.max_img_seq_len = max_img_seq_length
+        self.max_seq_len = max_seq_length
+        self.max_seq_a_len = max_seq_a_length
+        self.mask_prob = mask_prob
+        self.max_masked_tokens = max_masked_tokens
+        self.is_train = is_train
+        self._triangle_mask = torch.tril(torch.ones((self.max_seq_len, 
+            self.max_seq_len), dtype=torch.long))
+
+
+
     def tensorize_example(self, text_a, text_b, img_feat,  #a caption; b tag
-            cls_token_segment_id=0, pad_token_segment_id=0, sequence_a_segment_id=0, sequence_b_segment_id=1):
+            cls_token_segment_id=0, pad_token_segment_id=0, sequence_a_segment_id=1, sequence_b_segment_id=0):
         if self.is_train:
             tokens_a = self.tokenizer.tokenize(text_a)
         else:
@@ -188,50 +213,50 @@ class CaptionTensorizer(object):
         return (input_ids, attention_mask, segment_ids, img_feat, masked_pos)
 
 
-class CaptionTSVDatasetWithConstraints(CaptionTSVDataset):
-    r"""
-    Providing inputs for inference with Constraint Beam Search
+# class CaptionTSVDatasetWithConstraints(CaptionTSVDataset):
+#     r"""
+#     Providing inputs for inference with Constraint Beam Search
 
-    nms_threshold: float, optional (default = 0.85)
-        NMS threshold for suppressing generic object class names during constraint filtering,
-        for two boxes with IoU higher than this threshold, "dog" suppresses "animal".
-    max_given_constraints: int, optional (default = 3)
-        Maximum number of constraints which can be specified for CBS decoding. Constraints are
-        selected based on the prediction confidence score of their corresponding bounding boxes.
-    """
+#     nms_threshold: float, optional (default = 0.85)
+#         NMS threshold for suppressing generic object class names during constraint filtering,
+#         for two boxes with IoU higher than this threshold, "dog" suppresses "animal".
+#     max_given_constraints: int, optional (default = 3)
+#         Maximum number of constraints which can be specified for CBS decoding. Constraints are
+#         selected based on the prediction confidence score of their corresponding bounding boxes.
+#     """
 
-    def __init__(
-        self, yaml_file,
-        nms_threshold=0.85,
-        max_given_constraints=3, **kwargs
-    ):
-        super().__init__(yaml_file, **kwargs)
-        boxes_tsvpath = find_file_path_in_yaml(self.cfg['cbs_box'], self.root)
-        constraint2tokens_tsvpath = find_file_path_in_yaml(self.cfg['cbs_constraint'], self.root)
-        tokenforms_tsvpath = find_file_path_in_yaml(self.cfg['cbs_tokenforms'], self.root)
-        hierarchy_jsonpath = find_file_path_in_yaml(self.cfg['cbs_hierarchy'], self.root)
+#     def __init__(
+#         self, yaml_file,
+#         nms_threshold=0.85,
+#         max_given_constraints=3, **kwargs
+#     ):
+#         super().__init__(yaml_file, **kwargs)
+#         boxes_tsvpath = find_file_path_in_yaml(self.cfg['cbs_box'], self.root)
+#         constraint2tokens_tsvpath = find_file_path_in_yaml(self.cfg['cbs_constraint'], self.root)
+#         tokenforms_tsvpath = find_file_path_in_yaml(self.cfg['cbs_tokenforms'], self.root)
+#         hierarchy_jsonpath = find_file_path_in_yaml(self.cfg['cbs_hierarchy'], self.root)
 
-        self._boxes_reader = ConstraintBoxesReader(boxes_tsvpath)
-        self._constraint_filter = ConstraintFilter(
-            hierarchy_jsonpath, nms_threshold, max_given_constraints
-        )
-        self._fsm_builder = FiniteStateMachineBuilder(self.tokenizer,
-                constraint2tokens_tsvpath, tokenforms_tsvpath,
-                max_given_constraints)
+#         self._boxes_reader = ConstraintBoxesReader(boxes_tsvpath)
+#         self._constraint_filter = ConstraintFilter(
+#             hierarchy_jsonpath, nms_threshold, max_given_constraints
+#         )
+#         self._fsm_builder = FiniteStateMachineBuilder(self.tokenizer,
+#                 constraint2tokens_tsvpath, tokenforms_tsvpath,
+#                 max_given_constraints)
 
-    def __getitem__(self, index):
-        img_key, example = super().__getitem__(index)
+#     def __getitem__(self, index):
+#         img_key, example = super().__getitem__(index)
 
-        # Apply constraint filtering to object class names.
-        constraint_boxes = self._boxes_reader[img_key]
+#         # Apply constraint filtering to object class names.
+#         constraint_boxes = self._boxes_reader[img_key]
 
-        candidates = self._constraint_filter(
-            constraint_boxes["boxes"], constraint_boxes["class_names"], constraint_boxes["scores"]
-        )
-        num_constraints = len(candidates)
-        fsm, nstates = self._fsm_builder.build(candidates)
+#         candidates = self._constraint_filter(
+#             constraint_boxes["boxes"], constraint_boxes["class_names"], constraint_boxes["scores"]
+#         )
+#         num_constraints = len(candidates)
+#         fsm, nstates = self._fsm_builder.build(candidates)
 
-        return img_key, example + (fsm, num_constraints, )
+#         return img_key, example + (fsm, num_constraints, )
 
 
 
@@ -275,11 +300,11 @@ def make_data_loader(args, yaml_file, tokenizer, is_distributed=True,
         shuffle = True
         images_per_gpu = args.per_gpu_train_batch_size
         images_per_batch = images_per_gpu * get_world_size()
-        iters_per_batch = len(dataset) // images_per_batch
-        num_iters = iters_per_batch * args.num_train_epochs
+        #iters_per_batch = len(dataset) // images_per_batch
+        #num_iters = iters_per_batch * args.num_train_epochs
         logger.info("Train with {} images per GPU.".format(images_per_gpu))
         logger.info("Total batch size {}".format(images_per_batch))
-        logger.info("Total training steps {}".format(num_iters))
+        # logger.info("Total training steps {}".format(num_iters))
     else:
         shuffle = False
         images_per_gpu = args.per_gpu_eval_batch_size
@@ -293,17 +318,21 @@ def make_data_loader(args, yaml_file, tokenizer, is_distributed=True,
     return data_loader
 
 
-def save_checkpoint(model, tokenizer, args, epoch, iteration, num_trial=10):
+def save_checkpoint(model, tokenizer, args, epoch, iteration, optimizer, scheduler, num_trial=10):
     checkpoint_dir = op.join(args.output_dir, 'checkpoint-{}-{}'.format(
         epoch, iteration))
-    if not is_main_process():
-        return checkpoint_dir
     mkdir(checkpoint_dir)
     model_to_save = model.module if hasattr(model, 'module') else model
     for i in range(num_trial):
         try:
             model_to_save.save_pretrained(checkpoint_dir)
             torch.save(args, op.join(checkpoint_dir, 'training_args.bin'))
+            torch.save({
+                'epoch': epoch,
+                'global_step': iteration,
+                'scheduler': scheduler.state_dict(),
+                'optimizer': optimizer.state_dict(),
+            }, op.join(checkpoint_dir, 'epoch_step_opt_sc.bin'))
             tokenizer.save_pretrained(checkpoint_dir)
             logger.info("Save checkpoint to {}".format(checkpoint_dir))
             break
@@ -320,14 +349,7 @@ def compute_score_with_logits(logits, labels):
     return scores
 
 
-def train(args, train_dataloader, val_dataset, model, tokenizer):
-    if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(
-            model, device_ids=[args.local_rank], 
-            output_device=args.local_rank,
-            find_unused_parameters=True,
-        )
-
+def train(args, train_dataloader, val_dataset, model, tokenizer, writer):
     if args.max_steps > 0:
         t_total = args.max_steps
         args.num_train_epochs = args.max_steps // (len(train_dataloader) // \
@@ -344,7 +366,40 @@ def train(args, train_dataloader, val_dataset, model, tokenizer):
         {'params': [p for n, p in model.named_parameters() if \
             any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
     ]
-    optimizer = AdamW(grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
+    if args.amp:
+        from apex import amp
+        try:
+            # from apex.optimizers import FP16_Optimizer
+            #from pytorch_pretrained_bert.optimization_fp16 import FP16_Optimizer_State
+            from apex.optimizers import FusedAdam
+        except ImportError:
+            raise ImportError(
+                "Please install apex from https://www.github.com/nvidia/apex to use distributed and fp16 training.")
+
+        optimizer = FusedAdam(grouped_parameters,
+                              lr=args.learning_rate,
+                              eps=args.adam_epsilon,
+                              bias_correction=False)
+    else:
+        optimizer = AdamW(grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
+
+    if args.amp:
+        model, optimizer = amp.initialize(model, optimizer, opt_level='O2')#'02')
+    if args.distributed:
+        if args.amp:
+            try:
+                from apex.parallel import DistributedDataParallel as DDP 
+            except ImportError:
+                raise ImportError(
+                    'Please install apex from https://www.github.com/nvidia/apex to use distributed fp16 for training.')
+            model = DDP(model)#,delay_allreduce=True)
+        else:   
+            model = torch.nn.parallel.DistributedDataParallel(
+                model, device_ids=[args.local_rank], 
+                output_device=args.local_rank,
+                find_unused_parameters=True,
+            )
+
     if args.scheduler == "constant":
         scheduler = WarmupConstantSchedule(
                 optimizer, warmup_steps=args.warmup_steps)
@@ -353,6 +408,23 @@ def train(args, train_dataloader, val_dataset, model, tokenizer):
                 optimizer, warmup_steps=args.warmup_steps, t_total=t_total)
     else:
         raise ValueError("Unknown scheduler type: {}".format(args.scheduler))
+
+    # restore scheduler, optimizer
+    if os.path.exists(op.join(args.model_name_or_path, 'epoch_step_opt_sc.bin')) \
+        and not 'VIVO' in args.model_name_or_path \
+        and not args.only_load_ckpt:
+        training_state = torch.load(op.join(args.model_name_or_path, 'epoch_step_opt_sc.bin'),
+            map_location=torch.device('cuda:{}'.format(args.local_rank)))
+        if args.load_optimizer:
+            optimizer.load_state_dict(training_state['optimizer'])
+        scheduler.load_state_dict(training_state['scheduler'])
+        if args.load_optimizer:
+            logger.info("  Loading optimizer and scheduler from {}".format(op.join(args.model_name_or_path, 'epoch_step_opt_sc.bin')))
+        else:
+            logger.info("  Loading scheduler from {}".format(op.join(args.model_name_or_path, 'epoch_step_opt_sc.bin')))
+        start_epoch = training_state['epoch']+1
+    else:
+        start_epoch = 0
 
     logger.info("***** Running training *****")
     logger.info("  Num Epochs = %d", args.num_train_epochs)
@@ -370,20 +442,58 @@ def train(args, train_dataloader, val_dataset, model, tokenizer):
         logger.info("  SCST training...")
 
 
-    global_step, global_loss, global_acc =0,  0.0, 0.0
+    global_step, global_loss, global_acc = start_epoch*t_total/args.num_train_epochs,  0.0, 0.0
     model.zero_grad()
-    eval_log = []
+    eval_log = {}
+    for name in val_dataset:
+        eval_log[name] = []
     best_score = 0
-    for epoch in range(int(args.num_train_epochs)):
+    checkpoint_dir = None
+
+    if not args.distributed or args.local_rank == 0:
+        pbar = ProgressBar(n_total=len(train_dataloader), desc='Training')
+
+
+    for epoch in range(start_epoch, int(args.num_train_epochs)):
+        train_dataloader.dataset.set_epoch(epoch)
+        for name in val_dataset:
+            val_dataset[name].dataset.set_epoch(epoch)
+
+        if epoch==start_epoch and is_main_process():
+            if args.evaluate_during_training: 
+                for name in val_dataset:
+                    logger.info(name+": Perform evaluation at step: %d epoch %d" % (global_step, epoch))
+                    evaluate_file = evaluate(args, val_dataset[name], model, tokenizer,
+                            args.model_name_or_path, epoch, dataset=name)
+                    with open(evaluate_file, 'r') as f:
+                        res = json.load(f)
+                    best_score = max(best_score, res['CIDEr'])
+                    res['epoch'] = epoch
+                    res['global_step'] = 0
+                    res['best_CIDEr'] = best_score
+                    eval_log[name].append(res)
+                    with open(args.output_dir + '/eval_logs_{}_{}.json'.format(name, epoch), 'w') as f:
+                        json.dump(eval_log[name], f)
+        if get_world_size() > 1:
+            torch.distributed.barrier()
+
         for step, (img_keys, batch) in enumerate(train_dataloader):
             batch = tuple(t.to(args.device) for t in batch)
-
+            #evaluate at the start!
             if not args.scst:
                 model.train()
                 inputs = {'input_ids': batch[0], 'attention_mask': batch[1],
                     'token_type_ids': batch[2], 'img_feats': batch[3], 
                     'masked_pos': batch[4], 'masked_ids': batch[5]
                 }
+                # torch.set_printoptions(profile="full")
+                # print(img_keys[0])
+                # print('input_ids', inputs['input_ids'][0])
+                # print('token_type_ids',inputs['token_type_ids'][0])
+                # print('masked_pos',inputs['masked_pos'][0])
+                # print('masked_ids',inputs['masked_ids'][0])
+                # print('img_feats',inputs['img_feats'][0][0:5,0:10])
+                # 4)
                 outputs = model(**inputs)
                 loss, logits = outputs[:2]
                 masked_ids = inputs['masked_ids']
@@ -396,39 +506,56 @@ def train(args, train_dataloader, val_dataset, model, tokenizer):
 
             if args.gradient_accumulation_steps > 1:
                 loss = loss / args.gradient_accumulation_steps
-            loss.backward()
+
+            if args.amp:
+                with amp.scale_loss(loss, optimizer) as scaled_loss:
+                    scaled_loss.backward()
+            else:
+                loss.backward()
+
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
             global_loss += loss.item()
             global_acc += batch_acc
+
+            if not args.distributed or args.local_rank == 0:
+                pbar(step)
+
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 global_step += 1
                 scheduler.step()
                 optimizer.step()
                 model.zero_grad()
                 if global_step % args.logging_steps == 0:
-                    logger.info("Epoch: {}, global_step: {}, lr: {:.6f}, loss: {:.4f} ({:.4f}), " \
-                        "score: {:.4f} ({:.4f})".format(epoch, global_step, 
-                        optimizer.param_groups[0]["lr"], loss, global_loss / global_step, 
-                        batch_acc, global_acc / global_step)
+                    logger.info("Epoch: {}, global_step: {}, lr: {:.6f}, loss: {:.4f}, " \
+                        "score: {:.4f}".format(epoch, global_step, 
+                        optimizer.param_groups[0]["lr"], loss,  batch_acc)
                     )
+                    if writer != None:
+                        writer.add_scalar('loss', loss, global_step=global_step)
+                        writer.add_scalar('batch_acc', batch_acc, global_step=global_step)
+                        writer.add_scalar('lr', optimizer.param_groups[0]["lr"], global_step=global_step)
 
-                if (args.save_steps > 0 and global_step % args.save_steps == 0) or \
-                        global_step == t_total:
-                    checkpoint_dir = save_checkpoint(model, tokenizer, args, epoch, global_step) 
-                    # evaluation
-                    if args.evaluate_during_training: 
-                        logger.info("Perform evaluation at step: %d" % (global_step))
-                        evaluate_file = evaluate(args, val_dataset, model, tokenizer,
-                                checkpoint_dir)
-                        with open(evaluate_file, 'r') as f:
-                            res = json.load(f)
-                        best_score = max(best_score, res['CIDEr'])
-                        res['epoch'] = epoch
-                        res['global_step'] = step
-                        res['best_CIDEr'] = best_score
-                        eval_log.append(res)
-                        with open(args.output_dir + '/eval_logs.json', 'w') as f:
-                            json.dump(eval_log, f)
+        if is_main_process():
+            checkpoint_dir = save_checkpoint(model, tokenizer, args, epoch, global_step, 
+                optimizer, scheduler, num_trial=10)
+        # evaluation
+        if args.evaluate_during_training and is_main_process(): 
+            logger.info("Perform evaluation at step: %d epoch %d" % (global_step, epoch))
+            evaluate_file = evaluate(args, val_dataset, model, tokenizer,
+                    checkpoint_dir, epoch)
+            with open(evaluate_file, 'r') as f:
+                res = json.load(f)
+            best_score = max(best_score, res['CIDEr'])
+            res['epoch'] = epoch
+            res['global_step'] = step
+            res['best_CIDEr'] = best_score
+            eval_log.append(res)
+            with open(args.output_dir + '/eval_logs_{}.json'.format(epoch), 'w') as f:
+                json.dump(eval_log, f)
+
+        if get_world_size() > 1:
+            torch.distributed.barrier()
+        print()
     return checkpoint_dir
 
 
@@ -492,15 +619,14 @@ def scst_train_iter(args, train_dataloader, model, scst_criterion,
     return loss
 
 
-def get_predict_file(output_dir, yaml_file, args):
+def get_predict_file(output_dir, yaml_file, args, epoch=None,data='coco'):
     cc = ['pred']
     # make sure it works with/without / in end of the path.
-    data = op.basename(op.join(args.data_dir, '')[:-1])
     split = op.basename(yaml_file)
     assert split.endswith('.yaml')
     split = split[:-5]
     cc.append(data)
-    cc.append(split)
+    cc.append(split) 
     cc.append('beam{}'.format(args.num_beams))
     cc.append('max{}'.format(args.max_gen_length))
     if args.add_od_labels:
@@ -511,6 +637,8 @@ def get_predict_file(output_dir, yaml_file, args):
         cc.append('cbs{}'.format(args.min_constraints_to_satisfy))
     if args.output_hidden_states:
         cc.append('hidden')
+    if epoch:
+        cc.append('epoch_{}'.format(epoch))
     return op.join(output_dir, '{}.tsv'.format('.'.join(cc)))
 
 
@@ -527,23 +655,18 @@ def get_evaluate_method(predict_file):
         return 'coco'
 
 
-def evaluate(args, val_dataloader, model, tokenizer, output_dir):
+def evaluate(args, val_dataloader, model, tokenizer, output_dir, epoch, dataset='coco'):
     predict_file = get_predict_file(output_dir,
-            val_dataloader.dataset.yaml_file, args)
+            val_dataloader.dataset.yaml_file, args, epoch, dataset) #name
     test(args, val_dataloader, model, tokenizer, predict_file)
 
-    if get_world_size() > 1:
-        torch.distributed.barrier()
     evaluate_file = get_evaluate_file(predict_file)
-    if is_main_process():
-        caption_file = val_dataloader.dataset.get_caption_file_in_coco_format()
-        data = val_dataloader.dataset.yaml_file.split('/')[-2]
-        if 'nocaps' not in data:
-            result = evaluate_on_coco_caption(predict_file, caption_file, outfile=evaluate_file)
-            logger.info('evaluation result: {}'.format(str(result)))
-            logger.info('evaluation result saved to {}'.format(evaluate_file))
-    if get_world_size() > 1:
-        torch.distributed.barrier()
+    caption_file = val_dataloader.dataset.get_caption_file_in_coco_format()
+    data = val_dataloader.dataset.yaml_file.split('/')[-2]
+    logger.info('Evaluate {}'.format(dataset))
+    result = evaluate_on_coco_caption(predict_file, caption_file, outfile=evaluate_file)
+    logger.info('evaluation result: {}'.format(str(result)))
+    logger.info('evaluation result saved to {}'.format(evaluate_file))
     return evaluate_file
 
 
@@ -551,12 +674,6 @@ def test(args, test_dataloader, model, tokenizer, predict_file):
     cls_token_id, sep_token_id, pad_token_id, mask_token_id, period_token_id = \
         tokenizer.convert_tokens_to_ids([tokenizer.cls_token, tokenizer.sep_token, 
         tokenizer.pad_token, tokenizer.mask_token, '.'])
-    world_size = get_world_size()
-    if world_size == 1:
-        cache_file = predict_file
-    else:
-        cache_file = op.splitext(predict_file)[0] + '_{}_{}'.format(get_rank(), 
-                world_size) + op.splitext(predict_file)[1]
 
     model.eval()
     inputs_param = {'is_decode': True,
@@ -580,6 +697,7 @@ def test(args, test_dataloader, model, tokenizer, predict_file):
         "num_keep_best": args.num_keep_best,
     }
     if args.use_cbs:
+        assert False, 'Not support cbs now'
         inputs_param.update({'use_cbs': True,
             'min_constraints_to_satisfy': args.min_constraints_to_satisfy,
         })
@@ -618,17 +736,12 @@ def test(args, test_dataloader, model, tokenizer, predict_file):
 
         logger.info("Inference model computing time: {} seconds per batch".format(time_meter / (step+1)))
 
-    tsv_writer(gen_rows(), cache_file)
-    if world_size > 1:
-        torch.distributed.barrier()
-    if world_size > 1 and is_main_process():
-        cache_files = [op.splitext(predict_file)[0] + '_{}_{}'.format(i, world_size) + \
-            op.splitext(predict_file)[1] for i in range(world_size)]
-        concat_tsv_files(cache_files, predict_file)
-        delete_tsv_files(cache_files)
-        reorder_tsv_keys(predict_file, test_dataloader.dataset.image_keys, predict_file)
-    if world_size > 1:
-        torch.distributed.barrier()
+    tsv_writer(gen_rows(), predict_file)
+    # cache_files = [op.splitext(predict_file)[0] + '_{}_{}'.format(i, world_size) + \
+    #     op.splitext(predict_file)[1] for i in range(world_size)]
+    # concat_tsv_files(cache_files, predict_file)
+    # delete_tsv_files(cache_files)
+    # reorder_tsv_keys(predict_file, test_dataloader.dataset.image_keys, predict_file)
 
 
 def restore_training_settings(args):
@@ -639,6 +752,8 @@ def restore_training_settings(args):
     else:
         assert args.do_test or args.do_eval
         checkpoint = args.eval_model_dir
+    if 'VIVO' in checkpoint:
+        return args
     # restore training settings, check hasattr for backward compatibility
     train_args = torch.load(op.join(checkpoint, 'training_args.bin'))
     if hasattr(train_args, 'max_seq_a_length'):
@@ -837,7 +952,9 @@ def main():
     parser.add_argument('--amp', action='store_true',
                         help="Whether to use amp for fp16")
     parser.add_argument('--load_optimizer', action='store_true', help='whether to load optimizer')
-
+    parser.add_argument('--only_load_ckpt', action='store_true', help='not to load optimizer, scheduler and epoch')
+    parser.add_argument('--evaluate_nocaps', action='store_true')
+    parser.add_argument('--nocaps_evaluate_dir', type=str, default='Null')
     args = parser.parse_args()
 
     global logger
@@ -859,8 +976,12 @@ def main():
     logger = setup_logger("coco_finetune", output_dir, args.local_rank)
     logger.warning("Device: %s, n_gpu: %s", args.device, args.num_gpus)
     set_seed(args.seed, args.num_gpus)
-    args = restore_training_settings(args)
 
+    args = restore_training_settings(args)
+    if not args.distributed or (args.local_rank==0):
+        writer = SummaryWriter(logdir=output_dir)
+    else:
+        writer = None
     # Load pretrained model and tokenizer
     config_class, model_class, tokenizer_class = BertConfig, BertForImageCaptioning, BertTokenizer
     if args.do_train:
@@ -897,18 +1018,24 @@ def main():
     if args.do_train:
         train_dataloader = make_data_loader(args, args.train_yaml, tokenizer,
             args.distributed, is_train=True)
-        val_dataloader = None
+        val_dataloader = {}
         if args.evaluate_during_training:
-            val_dataloader = make_data_loader(args, args.val_yaml, tokenizer,
+            val_dataloader['coco'] = make_data_loader(args, args.val_yaml, tokenizer,
                 args.distributed, is_train=False)
-        last_checkpoint = train(args, train_dataloader, val_dataloader, model, tokenizer)
+        if args.evaluate_nocaps:
+            assert op.isdir(args.nocaps_evaluate_dir)
+            for split in ['in','near','out']:
+                yaml_file = op.join(args.nocaps_evaluate_dir, '{}.yaml'.format(split))
+                val_dataloader['nocaps_{}'.format(split)]=make_data_loader(
+                    args, yaml_file, tokenizer, args.distributed, is_train=False)
+        last_checkpoint = train(args, train_dataloader, val_dataloader, model, tokenizer, writer)
 
         # test the last checkpoint after training
         if args.do_test:
             logger.info("Evaluate on dataset: " + args.test_yaml)
             test_dataloader = make_data_loader(args, args.test_yaml, 
                 tokenizer, args.distributed, is_train=False)
-            evaluate(args, test_dataloader, model, tokenizer, last_checkpoint)
+            evaluate(args, test_dataloader, model, tokenizer, last_checkpoint, 'last')
 
     # inference and evaluation
     elif args.do_test or args.do_eval:
@@ -922,7 +1049,7 @@ def main():
             logger.info("Prediction results saved to: {}".format(predict_file))
         else:
             evaluate_file = evaluate(args, test_dataloader, model, tokenizer,
-                    checkpoint)
+                    checkpoint, None)
             logger.info("Evaluation results saved to: {}".format(evaluate_file))
 
 if __name__ == "__main__":
