@@ -539,19 +539,21 @@ def train(args, train_dataloader, val_dataset, model, tokenizer, writer):
             checkpoint_dir = save_checkpoint(model, tokenizer, args, epoch, global_step, 
                 optimizer, scheduler, num_trial=10)
         # evaluation
-        if args.evaluate_during_training and is_main_process(): 
-            logger.info("Perform evaluation at step: %d epoch %d" % (global_step, epoch))
-            evaluate_file = evaluate(args, val_dataset, model, tokenizer,
-                    checkpoint_dir, epoch)
-            with open(evaluate_file, 'r') as f:
-                res = json.load(f)
-            best_score = max(best_score, res['CIDEr'])
-            res['epoch'] = epoch
-            res['global_step'] = step
-            res['best_CIDEr'] = best_score
-            eval_log.append(res)
-            with open(args.output_dir + '/eval_logs_{}.json'.format(epoch), 'w') as f:
-                json.dump(eval_log, f)
+
+        if args.evaluate_during_training: 
+            for name in val_dataset:
+                logger.info(name+": Perform evaluation at step: %d epoch %d" % (global_step, epoch))
+                evaluate_file = evaluate(args, val_dataset[name], model, tokenizer,
+                        args.model_name_or_path, epoch, dataset=name)
+                with open(evaluate_file, 'r') as f:
+                    res = json.load(f)
+                best_score = max(best_score, res['CIDEr'])
+                res['epoch'] = epoch
+                res['global_step'] = 0
+                res['best_CIDEr'] = best_score
+                eval_log[name].append(res)
+                with open(args.output_dir + '/eval_logs_{}_{}.json'.format(name, epoch), 'w') as f:
+                    json.dump(eval_log[name], f)
 
         if get_world_size() > 1:
             torch.distributed.barrier()
