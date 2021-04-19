@@ -444,10 +444,10 @@ def train(args, train_dataloader, val_dataset, model, tokenizer, writer):
 
     global_step, global_loss, global_acc = start_epoch*t_total/args.num_train_epochs,  0.0, 0.0
     model.zero_grad()
-    eval_log = {}
+    eval_log, best_score = {}, {}
     for name in val_dataset:
         eval_log[name] = []
-    best_score = 0
+        best_score[name] = 0
     checkpoint_dir = None
 
     if not args.distributed or args.local_rank == 0:
@@ -464,13 +464,13 @@ def train(args, train_dataloader, val_dataset, model, tokenizer, writer):
                 for name in val_dataset:
                     logger.info(name+": Perform evaluation at step: %d epoch %d" % (global_step, epoch))
                     evaluate_file = evaluate(args, val_dataset[name], model, tokenizer,
-                            args.model_name_or_path, epoch, dataset=name)
+                            args.model_name_or_path, epoch-1, dataset=name)
                     with open(evaluate_file, 'r') as f:
                         res = json.load(f)
-                    best_score = max(best_score, res['CIDEr'])
+                    best_score[name] = max(best_score[name], res['CIDEr'])
                     res['epoch'] = epoch
                     res['global_step'] = 0
-                    res['best_CIDEr'] = best_score
+                    res['best_CIDEr'] = best_score[name]
                     eval_log[name].append(res)
                     with open(args.output_dir + '/eval_logs_{}_{}.json'.format(name, epoch), 'w') as f:
                         json.dump(eval_log[name], f)
@@ -545,13 +545,15 @@ def train(args, train_dataloader, val_dataset, model, tokenizer, writer):
             for name in val_dataset:
                 logger.info(name+": Perform evaluation at step: %d epoch %d" % (global_step, epoch))
                 evaluate_file = evaluate(args, val_dataset[name], model, tokenizer,
-                        args.model_name_or_path, epoch, dataset=name)
+                        checkpoint_dir, epoch, dataset=name)
                 with open(evaluate_file, 'r') as f:
                     res = json.load(f)
-                best_score = max(best_score, res['CIDEr'])
+                if writer:
+                    writer.add_scalar('{}_CIDEr'.format(name), res['CIDEr'], global_step=global_step)
+                best_score[name] = max(best_score[name], res['CIDEr'])
                 res['epoch'] = epoch
                 res['global_step'] = 0
-                res['best_CIDEr'] = best_score
+                res['best_CIDEr'] = best_score[name]
                 eval_log[name].append(res)
                 with open(args.output_dir + '/eval_logs_{}_{}.json'.format(name, epoch), 'w') as f:
                     json.dump(eval_log[name], f)
