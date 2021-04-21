@@ -94,8 +94,11 @@ class CaptionKaraDataset(torch.utils.data.IterableDataset):
         return cap_file
 
     def __len__(self):
-        n_gpu = get_world_size()
-        return len(self.labels)//n_gpu
+        if self.is_train:
+            n_gpu = get_world_size()
+            return len(self.labels)//n_gpu
+        else:
+            return len(self.labels)
 
 class CaptionTensorizer(object):
     def __init__(self, tokenizer, max_img_seq_length=50, max_seq_length=70, 
@@ -753,37 +756,23 @@ def restore_training_settings(args):
     if args.do_train:
         if not args.scst:
             return args
-        checkpoint = args.model_name_or_path
+        else:
+            assert False, 'not support scst now'
     else:
         assert args.do_test or args.do_eval
-        checkpoint = args.eval_model_dir
-    if 'VIVO' in checkpoint:
-        return args
-    # restore training settings, check hasattr for backward compatibility
-    train_args = torch.load(op.join(checkpoint, 'training_args.bin'))
-    if hasattr(train_args, 'max_seq_a_length'):
-        if hasattr(train_args, 'scst') and train_args.scst:
-            max_od_labels_len = train_args.max_seq_length - train_args.max_gen_length
-        else:
-            max_od_labels_len = train_args.max_seq_length - train_args.max_seq_a_length
-        max_seq_length = args.max_gen_length + max_od_labels_len
-        args.max_seq_length = max_seq_length
-        logger.warning('Override max_seq_length to {} = max_gen_length:{} + od_labels_len:{}'.format(
-                max_seq_length, args.max_gen_length, max_od_labels_len))
-
-
-    override_params = ['max_seq_a_length', 'do_lower_case', 'add_od_labels',
-            'max_img_seq_length']
-    for param in override_params:
-        if hasattr(train_args, param):
-            train_v = getattr(train_args, param)
-            test_v = getattr(args, param)
-            if train_v != test_v:
-                logger.warning('Override {} with train args: {} -> {}'.format(param,
-                    test_v, train_v))
-                setattr(args, param, train_v)
-    return args
-
+        args_load = torch.load(op.join(args.model_name_or_path,'training_args.bin'))
+        args_load.num_workers = 1
+        args_load.output_dir = args.output_dir
+        args_load.eval_model_dir = args.eval_model_dir
+        args_load.max_gen_length, args_load.num_beams = args.max_gen_length, args.num_beams
+        args_load.num_keep_best = args.num_keep_best
+        args_load.repetition_penalty, args_load.length_penalty = args.repetition_penalty, args.length_penalty
+        args_load.data_dir = args.data_dir
+        args_load.do_train, args_load.do_eval, args_load.do_test = args.do_train, args.do_eval, args.do_test
+        args_load.model_name_or_path = args.model_name_or_path
+        args_load.nocaps_evaluate_dir = args.nocaps_evaluate_dir
+        args_load.evaluate_nocaps, args_load.evaluate_coco = args.evaluate_nocaps, args.evaluate_coco
+    return args_load
 
 def get_world_size():
     if not dist.is_available():
@@ -959,6 +948,7 @@ def main():
     parser.add_argument('--load_optimizer', action='store_true', help='whether to load optimizer')
     parser.add_argument('--only_load_ckpt', action='store_true', help='not to load optimizer, scheduler and epoch')
     parser.add_argument('--evaluate_nocaps', action='store_true')
+    parser.add_argument('--evaluate_coco', action='store_true')
     parser.add_argument('--nocaps_evaluate_dir', type=str, default='Null')
     args = parser.parse_args()
 
@@ -1044,18 +1034,29 @@ def main():
 
     # inference and evaluation
     elif args.do_test or args.do_eval:
-        logger.info("Evaluate on dataset: " + args.test_yaml)
-        test_dataloader = make_data_loader(args, args.test_yaml,
-            tokenizer, args.distributed, is_train=False)
+        test_dataloader = {}
+        assert args.evaluate_coco or args.evaluate_nocaps
+        if args.evaluate_coco:
+            logger.info("Evaluate on dataset: " + args.test_yaml)
+            test_dataloader['coco'] = make_data_loader(args, args.test_yaml,
+                tokenizer, args.distributed, is_train=False)
+        if args.evaluate_nocaps:
+            assert op.isdir(args.nocaps_evaluate_dir)
+            for split in ['in','near','out']:
+                yaml_file = op.join(args.nocaps_evaluate_dir, '{}.yaml'.format(split))
+                test_dataloader['nocaps_{}'.format(split)]=make_data_loader(
+                    args, yaml_file, tokenizer, args.distributed, is_train=False)            
 
-        if not args.do_eval:
-            predict_file = get_predict_file(checkpoint, test_dataloader.dataset.yaml_file, args)
-            test(args, test_dataloader, model, tokenizer, predict_file)
-            logger.info("Prediction results saved to: {}".format(predict_file))
-        else:
-            evaluate_file = evaluate(args, test_dataloader, model, tokenizer,
-                    checkpoint, None)
-            logger.info("Evaluation results saved to: {}".format(evaluate_file))
+        for name in test_dataloader:
+            if not args.do_eval:  #no need to produce evaluation results (bleu, meteor...)
+                predict_file = get_predict_file(checkpoint, test_dataloader[name].dataset.yaml_file, args,
+                    None,name)
+                test(args, test_dataloader[name], model, tokenizer, predict_file)
+                logger.info("Prediction {} results saved to: {}".format(name, predict_file))
+            else: # produce evaluation results
+                evaluate_file = evaluate(args, test_dataloader[name], model, tokenizer,
+                        checkpoint, None, dataset=name)
+                logger.info("Evaluation results saved to: {}".format(evaluate_file))
 
 if __name__ == "__main__":
     main()
