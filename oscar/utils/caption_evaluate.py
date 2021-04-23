@@ -56,7 +56,7 @@ def evaluate_on_nocaps(split, predict_file, data_dir='data/nocaps/', evaluate_fi
     return metrics
 
 
-def evaluate_on_coco_caption(res_file, label_file, outfile=None):
+def evaluate_on_coco_caption(res_file, label_file, outfile=None, return_imgscores=False):
     """
     res_tsv: TSV file, each row is [image_key, json format list of captions].
              Each caption is a dict, with fields "caption", "conf".
@@ -66,6 +66,8 @@ def evaluate_on_coco_caption(res_file, label_file, outfile=None):
     if res_file.endswith('.tsv'):
         res_file_coco = op.splitext(res_file)[0] + '_coco_format.json'
         convert_tsv_to_coco_format(res_file, res_file_coco)
+    elif res_file.endswith('.json'):
+        res_file_coco = res_file
     else:
         raise ValueError('unknown prediction result file format: {}'.format(res_file))
 
@@ -87,7 +89,11 @@ def evaluate_on_coco_caption(res_file, label_file, outfile=None):
     else:
         with open(outfile, 'w') as fp:
             json.dump(result, fp, indent=4)
-    return result
+
+    if return_imgscores:
+        return result, cocoEval.imgToEval
+    else:
+        return result
 
 
 def convert_tsv_to_coco_format(res_tsv, outfile,

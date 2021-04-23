@@ -550,14 +550,18 @@ class ConstraintFilter(object):
         for i in range(len(class_names)):
             if scores[i] > 0 and class_names[i] not in self.BLACKLIST:
                 keep_indices.append(i)
-
+        #print('class_names',[(i,c) for i, c in enumerate(class_names)])
+        #print('keep_indices',keep_indices)
         boxes = boxes[keep_indices]
         class_names = [class_names[i] for i in keep_indices]
+        #added by yutong remove bracket
+        class_names = [c.split(' (')[0] for c in class_names]
         scores = scores[keep_indices]
 
         # Perform non-maximum suppression according to category hierarchy. For example, for highly
         # overlapping boxes on a dog, "dog" suppresses "animal".
         keep_indices = self._nms(boxes, class_names)
+        #print('keep_indices',keep_indices)
         boxes = boxes[keep_indices]
         class_names = [class_names[i] for i in keep_indices]
         scores = scores[keep_indices]

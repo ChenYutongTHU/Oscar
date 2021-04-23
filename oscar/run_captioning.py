@@ -66,8 +66,11 @@ class CaptionKaraDataset(torch.utils.data.IterableDataset):
             self.labels = json.load(f)  #[id,[labels]], [id, [labels],[id,[labels]]]
         # print('labels',len(self.labels))
         # input()
-        with open(self.cfg['caption_path'],'r') as f:
-            self.captions = json.load(f)
+        if 'caption_path' in self.cfg:
+            with open(self.cfg['caption_path'],'r') as f:
+                self.captions = json.load(f)
+        else:
+            self.captions = None
         self.tokenizer = tokenizer
         self.tensorizer = CaptionTensorizer(self.tokenizer, max_img_seq_length,
                 max_seq_length, max_seq_a_length, mask_prob, max_masked_tokens, is_train=is_train)
@@ -80,7 +83,10 @@ class CaptionKaraDataset(torch.utils.data.IterableDataset):
             index, features = img[0], img[1]
             assert index < len(self.labels), (index, len(self.labels), len(self.iterable_ImgDataset))
             img_id, od_labels = self.labels[index]
-            img_id, caps = self.captions[index]
+            if self.captions:
+                img_id, caps = self.captions[index]
+            else:
+                caps = None
             example = self.tensorizer.tensorize_example(text_a=caps, text_b=od_labels, img_feat=torch.Tensor(features),
                 sequence_a_segment_id=1, sequence_b_segment_id=0)  #tag -> 0 caption -> 1
             yield img_id, example
@@ -215,51 +221,49 @@ class CaptionTensorizer(object):
             return (input_ids, attention_mask, segment_ids, img_feat, masked_pos, masked_ids)
         return (input_ids, attention_mask, segment_ids, img_feat, masked_pos)
 
+class CaptionKaraDatasetWithConstraints(CaptionKaraDataset):
+    def __init__(
+        self, yaml_file,
+        nms_threshold=0.85,
+        max_given_constraints=3, **kwargs
+    ):
+        super().__init__(yaml_file, **kwargs)
+        self.root=None
+        boxes_tsvpath = find_file_path_in_yaml(self.cfg['cbs_box'], self.root)
+        constraint2tokens_tsvpath = find_file_path_in_yaml(self.cfg['cbs_constraint'], self.root)
+        tokenforms_tsvpath = find_file_path_in_yaml(self.cfg['cbs_tokenforms'], self.root)
+        hierarchy_jsonpath = find_file_path_in_yaml(self.cfg['cbs_hierarchy'], self.root)
+        self._boxes_reader = ConstraintBoxesReader(boxes_tsvpath)
+        self._constraint_filter = ConstraintFilter(
+            hierarchy_jsonpath, nms_threshold, max_given_constraints
+        )
+        self._fsm_builder = FiniteStateMachineBuilder(self.tokenizer,
+                constraint2tokens_tsvpath, tokenforms_tsvpath,
+                max_given_constraints)
 
-# class CaptionTSVDatasetWithConstraints(CaptionTSVDataset):
-#     r"""
-#     Providing inputs for inference with Constraint Beam Search
 
-#     nms_threshold: float, optional (default = 0.85)
-#         NMS threshold for suppressing generic object class names during constraint filtering,
-#         for two boxes with IoU higher than this threshold, "dog" suppresses "animal".
-#     max_given_constraints: int, optional (default = 3)
-#         Maximum number of constraints which can be specified for CBS decoding. Constraints are
-#         selected based on the prediction confidence score of their corresponding bounding boxes.
-#     """
+    def __iter__(self):
+        for img in self.iterable_ImgDataset:
+            index, features = img[0], img[1]
+            assert index < len(self.labels), (index, len(self.labels), len(self.iterable_ImgDataset))
+            img_id, od_labels = self.labels[index]
+            if self.captions:
+                img_id, caps = self.captions[index]
+            else:
+                caps = None
+            example = self.tensorizer.tensorize_example(text_a=caps, text_b=od_labels, img_feat=torch.Tensor(features),
+                sequence_a_segment_id=1, sequence_b_segment_id=0)  #tag -> 0 caption -> 1
+            
+            constraint_boxes = self._boxes_reader[img_id]
+            candidates = self._constraint_filter(
+                constraint_boxes["boxes"], constraint_boxes["class_names"], constraint_boxes["scores"]
+            )
+            num_constraints = len(candidates)
+            fsm, nstates = self._fsm_builder.build(candidates)            
+            yield img_id, example + (fsm, num_constraints, candidates)
 
-#     def __init__(
-#         self, yaml_file,
-#         nms_threshold=0.85,
-#         max_given_constraints=3, **kwargs
-#     ):
-#         super().__init__(yaml_file, **kwargs)
-#         boxes_tsvpath = find_file_path_in_yaml(self.cfg['cbs_box'], self.root)
-#         constraint2tokens_tsvpath = find_file_path_in_yaml(self.cfg['cbs_constraint'], self.root)
-#         tokenforms_tsvpath = find_file_path_in_yaml(self.cfg['cbs_tokenforms'], self.root)
-#         hierarchy_jsonpath = find_file_path_in_yaml(self.cfg['cbs_hierarchy'], self.root)
 
-#         self._boxes_reader = ConstraintBoxesReader(boxes_tsvpath)
-#         self._constraint_filter = ConstraintFilter(
-#             hierarchy_jsonpath, nms_threshold, max_given_constraints
-#         )
-#         self._fsm_builder = FiniteStateMachineBuilder(self.tokenizer,
-#                 constraint2tokens_tsvpath, tokenforms_tsvpath,
-#                 max_given_constraints)
 
-#     def __getitem__(self, index):
-#         img_key, example = super().__getitem__(index)
-
-#         # Apply constraint filtering to object class names.
-#         constraint_boxes = self._boxes_reader[img_key]
-
-#         candidates = self._constraint_filter(
-#             constraint_boxes["boxes"], constraint_boxes["class_names"], constraint_boxes["scores"]
-#         )
-#         num_constraints = len(candidates)
-#         fsm, nstates = self._fsm_builder.build(candidates)
-
-#         return img_key, example + (fsm, num_constraints, )
 
 
 
@@ -275,8 +279,7 @@ def build_dataset(yaml_file, tokenizer, args, is_train=True):
             max_seq_length=args.max_seq_length, max_seq_a_length=args.max_seq_a_length,
             is_train=True, mask_prob=args.mask_prob, max_masked_tokens=args.max_masked_tokens)
     if args.use_cbs:
-        assert args.use_cbs==False, 'not support CBS dataloader now'
-        dataset_class = CaptionTSVDatasetWithConstraints
+        dataset_class = CaptionKaraDatasetWithConstraints
     else:
         dataset_class = CaptionKaraDataset
     return dataset_class(yaml_file, tokenizer=tokenizer,
@@ -705,15 +708,23 @@ def test(args, test_dataloader, model, tokenizer, predict_file):
         "num_keep_best": args.num_keep_best,
     }
     if args.use_cbs:
-        assert False, 'Not support cbs now'
+        #assert False, 'Not support cbs now'
         inputs_param.update({'use_cbs': True,
             'min_constraints_to_satisfy': args.min_constraints_to_satisfy,
         })
-    def gen_rows():
+    def gen_rows(predict_file):
         time_meter = 0
-
+        id2constraints = {}
         with torch.no_grad():
             for step, (img_keys, batch) in tqdm(enumerate(test_dataloader)):
+                ## added by yutong to output constrain
+                if args.use_cbs:
+                    assert args.per_gpu_eval_batch_size==1, args.per_gpu_eval_batch_size
+                    constraints = batch[-1]
+                    id2constraints[img_keys[0]] = constraints
+                    batch = batch[:-1]
+                    #!!!!
+                    #continue
                 batch = tuple(t.to(args.device) for t in batch)
                 inputs = {
                     'input_ids': batch[0], 'attention_mask': batch[1],
@@ -725,6 +736,9 @@ def test(args, test_dataloader, model, tokenizer, predict_file):
                         'fsm': batch[5],
                         'num_constraints': batch[6],
                     })
+                # print(img_keys[0])
+                # print(constraints)
+                # input()
                 inputs.update(inputs_param)
                 tic = time.time()
                 # captions, logprobs
@@ -741,10 +755,12 @@ def test(args, test_dataloader, model, tokenizer, predict_file):
                     if isinstance(img_key, torch.Tensor):
                         img_key = img_key.item()
                     yield img_key, json.dumps(res)
-
+            with open(op.splitext(predict_file)[0] + '_constraints_{}.json'.format(3),'w') as f:
+                json.dump(id2constraints,f)
         logger.info("Inference model computing time: {} seconds per batch".format(time_meter / (step+1)))
 
-    tsv_writer(gen_rows(), predict_file)
+    tsv_writer(gen_rows(predict_file), predict_file)
+    print('Save constraints to ', op.splitext(predict_file)[0] + '_constraints_{}.json'.format(3))
     # cache_files = [op.splitext(predict_file)[0] + '_{}_{}'.format(i, world_size) + \
     #     op.splitext(predict_file)[1] for i in range(world_size)]
     # concat_tsv_files(cache_files, predict_file)
@@ -765,6 +781,9 @@ def restore_training_settings(args):
         args_load.output_dir = args.output_dir
         args_load.eval_model_dir = args.eval_model_dir
         args_load.max_gen_length, args_load.num_beams = args.max_gen_length, args.num_beams
+        args_load.use_cbs = args.use_cbs
+        if args.use_cbs:
+            assert args.per_gpu_eval_batch_size==1
         args_load.num_keep_best = args.num_keep_best
         args_load.repetition_penalty, args_load.length_penalty = args.repetition_penalty, args.length_penalty
         args_load.data_dir = args.data_dir
@@ -772,6 +791,9 @@ def restore_training_settings(args):
         args_load.model_name_or_path = args.model_name_or_path
         args_load.nocaps_evaluate_dir = args.nocaps_evaluate_dir
         args_load.evaluate_nocaps, args_load.evaluate_coco = args.evaluate_nocaps, args.evaluate_coco
+        args_load.min_constraints_to_satisfy = args.min_constraints_to_satisfy
+        args_load.per_gpu_eval_batch_size = args.per_gpu_eval_batch_size
+        args_load.nocaps_split = args.nocaps_split.split(',')
     return args_load
 
 def get_world_size():
@@ -950,6 +972,7 @@ def main():
     parser.add_argument('--evaluate_nocaps', action='store_true')
     parser.add_argument('--evaluate_coco', action='store_true')
     parser.add_argument('--nocaps_evaluate_dir', type=str, default='Null')
+    parser.add_argument('--nocaps_split',type=str,default='near,out,in,val')
     args = parser.parse_args()
 
     global logger
@@ -1019,14 +1042,14 @@ def main():
                 args.distributed, is_train=False)
         if args.evaluate_nocaps:
             assert op.isdir(args.nocaps_evaluate_dir)
-            for split in ['in','near','out']:
+            for split in args.nocaps_split:
                 yaml_file = op.join(args.nocaps_evaluate_dir, '{}.yaml'.format(split))
                 val_dataloader['nocaps_{}'.format(split)]=make_data_loader(
                     args, yaml_file, tokenizer, args.distributed, is_train=False)
         last_checkpoint = train(args, train_dataloader, val_dataloader, model, tokenizer, writer)
 
         # test the last checkpoint after training
-        if args.do_test:
+        if args.do_eval:
             logger.info("Evaluate on dataset: " + args.test_yaml)
             test_dataloader = make_data_loader(args, args.test_yaml, 
                 tokenizer, args.distributed, is_train=False)
@@ -1042,7 +1065,7 @@ def main():
                 tokenizer, args.distributed, is_train=False)
         if args.evaluate_nocaps:
             assert op.isdir(args.nocaps_evaluate_dir)
-            for split in ['in','near','out']:
+            for split in args.nocaps_split:
                 yaml_file = op.join(args.nocaps_evaluate_dir, '{}.yaml'.format(split))
                 test_dataloader['nocaps_{}'.format(split)]=make_data_loader(
                     args, yaml_file, tokenizer, args.distributed, is_train=False)            
