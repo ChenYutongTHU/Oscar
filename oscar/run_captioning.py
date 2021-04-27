@@ -271,7 +271,7 @@ class CaptionKaraDatasetWithConstraints(CaptionKaraDataset):
 def build_dataset(yaml_file, tokenizer, args, is_train=True):
     if not op.isfile(yaml_file):
         yaml_file = op.join(args.data_dir, yaml_file)
-        assert op.isfile(yaml_file)
+        assert op.isfile(yaml_file), yaml_file
 
     if is_train:
         return CaptionKaraDataset(yaml_file, tokenizer=tokenizer,
@@ -793,7 +793,7 @@ def restore_training_settings(args):
         args_load.evaluate_nocaps, args_load.evaluate_coco = args.evaluate_nocaps, args.evaluate_coco
         args_load.min_constraints_to_satisfy = args.min_constraints_to_satisfy
         args_load.per_gpu_eval_batch_size = args.per_gpu_eval_batch_size
-        args_load.nocaps_split = args.nocaps_split.split(',')
+        args_load.nocaps_split = args.nocaps_split#.split(',')
     return args_load
 
 def get_world_size():
@@ -972,7 +972,7 @@ def main():
     parser.add_argument('--evaluate_nocaps', action='store_true')
     parser.add_argument('--evaluate_coco', action='store_true')
     parser.add_argument('--nocaps_evaluate_dir', type=str, default='Null')
-    parser.add_argument('--nocaps_split',type=str,default='near,out,in,val')
+    parser.add_argument('--nocaps_split',type=str,default='near,out,in')
     args = parser.parse_args()
 
     global logger
@@ -980,6 +980,7 @@ def main():
     # Setup CUDA, GPU & distributed training
     local_rank = ensure_init_process_group(local_rank=args.local_rank)
     args.local_rank = local_rank
+    args.nocaps_split = args.nocaps_split.split(',')
     args.num_gpus = get_world_size()
     args.distributed = args.num_gpus > 1
     torch.cuda.set_device(args.local_rank)
