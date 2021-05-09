@@ -52,7 +52,7 @@ def read_wrapper(x):
 class CaptionKaraDataset(torch.utils.data.IterableDataset):
     def __init__(self, yaml_file, tokenizer=None, add_od_labels=True,
             max_img_seq_length=50, max_seq_length=70, max_seq_a_length=40, 
-            is_train=True, mask_prob=0.15, max_masked_tokens=3, **kwargs):
+            is_train=True, mask_prob=0.15, max_masked_tokens=3, scst=False, **kwargs):
         self.yaml_file = yaml_file
         self.cfg = load_from_yaml_file(yaml_file)
         self.storage = kara_storage.KaraStorage(self.cfg['storage_path'])  
@@ -69,13 +69,23 @@ class CaptionKaraDataset(torch.utils.data.IterableDataset):
         if 'caption_path' in self.cfg:
             with open(self.cfg['caption_path'],'r') as f:
                 self.captions = json.load(f)
+            self.key2captions = {}
+            for image_id, cap in self.captions:
+                if not image_id in self.key2captions:
+                    self.key2captions[image_id] = []
+                self.key2captions[image_id].append(cap)
+
         else:
             self.captions = None
+            self.key2captions = None
         self.tokenizer = tokenizer
-        self.tensorizer = CaptionTensorizer(self.tokenizer, max_img_seq_length,
-                max_seq_length, max_seq_a_length, mask_prob, max_masked_tokens, is_train=is_train)
 
-        self.is_train = is_train
+        self.is_train = is_train 
+        self.tensorizer = CaptionTensorizer(self.tokenizer, max_img_seq_length,
+                max_seq_length, max_seq_a_length, mask_prob, max_masked_tokens, 
+                is_train=(self.is_train and not scst))
+
+        self.scst = scst
         self.kwargs = kwargs
 
     def __iter__(self):
@@ -84,11 +94,12 @@ class CaptionKaraDataset(torch.utils.data.IterableDataset):
             assert index < len(self.labels), (index, len(self.labels), len(self.iterable_ImgDataset))
             img_id, od_labels = self.labels[index]
             if self.captions:
-                img_id, caps = self.captions[index]
+                _, caps = self.captions[index]
             else:
                 caps = None
             example = self.tensorizer.tensorize_example(text_a=caps, text_b=od_labels, img_feat=torch.Tensor(features),
-                sequence_a_segment_id=1, sequence_b_segment_id=0)  #tag -> 0 caption -> 1
+                sequence_a_segment_id=self.kwargs['cap_segment_id'], 
+                sequence_b_segment_id=self.kwargs['tag_segment_id'])  #tag -> 0 caption -> 1
             yield img_id, example
 
     def set_epoch(self, epoch):
@@ -98,6 +109,9 @@ class CaptionKaraDataset(torch.utils.data.IterableDataset):
         assert self.is_train==False
         cap_file = op.splitext(self.cfg['caption_path'])[0] + '_coco_format.json' #root
         return cap_file
+
+    def get_captions_by_key(self, key):
+        return self.key2captions[key]
 
     def __len__(self):
         if self.is_train:
@@ -268,16 +282,17 @@ class CaptionKaraDatasetWithConstraints(CaptionKaraDataset):
 
 
 
-def build_dataset(yaml_file, tokenizer, args, is_train=True):
+def build_dataset(yaml_file, tokenizer, args, is_train=True, scst=False):
     if not op.isfile(yaml_file):
         yaml_file = op.join(args.data_dir, yaml_file)
         assert op.isfile(yaml_file), yaml_file
 
-    if is_train:
+    if is_train and not scst: #istrain and not args.scst
         return CaptionKaraDataset(yaml_file, tokenizer=tokenizer,
             add_od_labels=args.add_od_labels, max_img_seq_length=args.max_img_seq_length,
             max_seq_length=args.max_seq_length, max_seq_a_length=args.max_seq_a_length,
-            is_train=True, mask_prob=args.mask_prob, max_masked_tokens=args.max_masked_tokens)
+            is_train=True, mask_prob=args.mask_prob, max_masked_tokens=args.max_masked_tokens,
+            cap_segment_id=args.cap_segment_id, tag_segment_id=args.tag_segment_id, scst=scst)
     if args.use_cbs:
         dataset_class = CaptionKaraDatasetWithConstraints
     else:
@@ -285,7 +300,8 @@ def build_dataset(yaml_file, tokenizer, args, is_train=True):
     return dataset_class(yaml_file, tokenizer=tokenizer,
             add_od_labels=args.add_od_labels, max_img_seq_length=args.max_img_seq_length,
             max_seq_length=args.max_seq_length, max_seq_a_length=args.max_gen_length,
-            is_train=False)
+            is_train=is_train, cap_segment_id=args.cap_segment_id, tag_segment_id=args.tag_segment_id,
+            scst=scst)
 
 
 def make_data_sampler(dataset, shuffle, distributed):
@@ -301,7 +317,7 @@ def make_data_sampler(dataset, shuffle, distributed):
 def make_data_loader(args, yaml_file, tokenizer, is_distributed=True, 
         is_train=True):
     dataset = build_dataset(yaml_file, tokenizer, args, 
-        is_train=(is_train and not args.scst))
+        is_train=is_train, scst=args.scst)
     if is_train:
         shuffle = True
         images_per_gpu = args.per_gpu_train_batch_size
@@ -418,7 +434,7 @@ def train(args, train_dataloader, val_dataset, model, tokenizer, writer):
     # restore scheduler, optimizer
     if os.path.exists(op.join(args.model_name_or_path, 'epoch_step_opt_sc.bin')) \
         and not 'VIVO' in args.model_name_or_path \
-        and not args.only_load_ckpt:
+        and not args.only_load_ckpt: #no need to reload scheduler and optimizer for 
         training_state = torch.load(op.join(args.model_name_or_path, 'epoch_step_opt_sc.bin'),
             map_location=torch.device('cuda:{}'.format(args.local_rank)))
         if args.load_optimizer:
@@ -438,6 +454,7 @@ def train(args, train_dataloader, val_dataset, model, tokenizer, writer):
     logger.info("  Total train batch size (w. parallel, & accumulation) = %d",
                    args.per_gpu_train_batch_size * get_world_size() * args.gradient_accumulation_steps)
     logger.info("  Gradient Accumulation steps = %d", args.gradient_accumulation_steps)
+    logger.info("  len train_dataloader = %d", len(train_dataloader))
     logger.info("  Total optimization steps = %d", t_total)
 
     if args.scst:
@@ -627,6 +644,14 @@ def scst_train_iter(args, train_dataloader, model, scst_criterion,
 
     gt_res = [train_dataloader.dataset.get_captions_by_key(k) for k in img_keys]
     loss = scst_criterion(gt_res, greedy_res, sample_res, sample_logprobs)
+    # if is_main_process():
+    #     for k, gt, greedy, sample in zip(img_keys, gt_res, greedy_res, sample_res):
+    #         logger.info('k:{}'.format(k))
+    #         logger.info('gt:{}'.format(gt))
+    #         logger.info('greedy:{}'.format(greedy))
+    #         logger.info('sample:{}'.format(sample))
+    #         logger.info('\n')
+    #         break
     return loss
 
 
@@ -771,11 +796,13 @@ def test(args, test_dataloader, model, tokenizer, predict_file):
 def restore_training_settings(args):
     if args.do_train:
         if not args.scst:
+            return args    
+        else: # args.scst
+            logger.info('SCST training max_seq_length{} max_gen_length{}'.format(args.max_seq_length,
+                args.max_gen_length))
             return args
-        else:
-            assert False, 'not support scst now'
     else:
-        assert args.do_test or args.do_eval
+        #assert args.do_test or args.do_eval
         args_load = torch.load(op.join(args.model_name_or_path,'training_args.bin'))
         args_load.num_workers = 1
         args_load.output_dir = args.output_dir
@@ -794,6 +821,19 @@ def restore_training_settings(args):
         args_load.min_constraints_to_satisfy = args.min_constraints_to_satisfy
         args_load.per_gpu_eval_batch_size = args.per_gpu_eval_batch_size
         args_load.nocaps_split = args.nocaps_split#.split(',')
+        args_load.cap_segment_id = args.cap_segment_id
+        args_load.tag_segment_id = args.tag_segment_id
+        if args_load.scst==False:
+            logger.info('Inference Override --  ')
+            logger.info('max_seq_length {} --> '.format(args_load.max_seq_length))
+            max_od_labels_len = args_load.max_seq_length - args_load.max_seq_a_length
+            args_load.max_seq_length = args_load.max_gen_length + max_od_labels_len
+            logger.info('max_seq_length {}={}+{}'.format(args_load.max_seq_length,
+                args_load.max_gen_length, max_od_labels_len))
+        else:
+            logger.info('Inference max_seq_length{} max_gen_length{}'.format(args_load.max_seq_length,
+                args_load.max_gen_length))
+        
     return args_load
 
 def get_world_size():
@@ -973,6 +1013,8 @@ def main():
     parser.add_argument('--evaluate_coco', action='store_true')
     parser.add_argument('--nocaps_evaluate_dir', type=str, default='Null')
     parser.add_argument('--nocaps_split',type=str,default='near,out,in')
+    parser.add_argument('--cap_segment_id',type=int,default=1)
+    parser.add_argument('--tag_segment_id',type=int,default=0)
     args = parser.parse_args()
 
     global logger
