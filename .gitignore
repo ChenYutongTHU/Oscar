@@ -1,10 +1,15 @@
 # Initially taken from Github's Python gitignore file
-
+caption_output
+VIVO_output
+*.sh
+Embeddings
+*.json
+*.txt
+*.ipynb
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
-
 # C extensions
 *.so
 

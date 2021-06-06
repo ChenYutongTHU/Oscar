@@ -52,14 +52,16 @@ def read_wrapper(x):
 class CaptionKaraDataset(torch.utils.data.IterableDataset):
     def __init__(self, yaml_file, tokenizer=None, add_od_labels=True,
             max_img_seq_length=50, max_seq_length=70, max_seq_a_length=40, 
-            is_train=True, mask_prob=0.15, max_masked_tokens=3, scst=False, **kwargs):
+            is_train=True, mask_prob=0.15, max_masked_tokens=3, scst=False, is_distributed=False,
+            **kwargs):
         self.yaml_file = yaml_file
         self.cfg = load_from_yaml_file(yaml_file)
         self.storage = kara_storage.KaraStorage(self.cfg['storage_path'])  
         self.storage_open = self.storage.open(self.cfg['split0'], self.cfg['split1'], 
             "r", serialization=FeatureSerializer())
         read_wrapper(self.storage_open)
-        self.iterable_ImgDataset = kara_storage.make_torch_dataset(self.storage_open, shuffle=is_train)
+        self.iterable_ImgDataset = kara_storage.make_torch_dataset(self.storage_open, 
+            shuffle=is_train, is_distributed=is_distributed and is_train)
 
         #print(len(self.iterable_ImgDataset))
         with open(self.cfg['label_path'],'r') as f:
@@ -282,7 +284,7 @@ class CaptionKaraDatasetWithConstraints(CaptionKaraDataset):
 
 
 
-def build_dataset(yaml_file, tokenizer, args, is_train=True, scst=False):
+def build_dataset(yaml_file, tokenizer, args, is_train=True, scst=False, is_distributed=False):
     if not op.isfile(yaml_file):
         yaml_file = op.join(args.data_dir, yaml_file)
         assert op.isfile(yaml_file), yaml_file
@@ -292,7 +294,8 @@ def build_dataset(yaml_file, tokenizer, args, is_train=True, scst=False):
             add_od_labels=args.add_od_labels, max_img_seq_length=args.max_img_seq_length,
             max_seq_length=args.max_seq_length, max_seq_a_length=args.max_seq_a_length,
             is_train=True, mask_prob=args.mask_prob, max_masked_tokens=args.max_masked_tokens,
-            cap_segment_id=args.cap_segment_id, tag_segment_id=args.tag_segment_id, scst=scst)
+            cap_segment_id=args.cap_segment_id, tag_segment_id=args.tag_segment_id, scst=scst,
+            is_distributed=is_distributed)
     if args.use_cbs:
         dataset_class = CaptionKaraDatasetWithConstraints
     else:
@@ -301,7 +304,7 @@ def build_dataset(yaml_file, tokenizer, args, is_train=True, scst=False):
             add_od_labels=args.add_od_labels, max_img_seq_length=args.max_img_seq_length,
             max_seq_length=args.max_seq_length, max_seq_a_length=args.max_gen_length,
             is_train=is_train, cap_segment_id=args.cap_segment_id, tag_segment_id=args.tag_segment_id,
-            scst=scst)
+            scst=scst, is_distributed=is_distributed)
 
 
 def make_data_sampler(dataset, shuffle, distributed):
@@ -317,7 +320,7 @@ def make_data_sampler(dataset, shuffle, distributed):
 def make_data_loader(args, yaml_file, tokenizer, is_distributed=True, 
         is_train=True):
     dataset = build_dataset(yaml_file, tokenizer, args, 
-        is_train=is_train, scst=args.scst)
+        is_train=is_train, scst=args.scst, is_distributed=is_distributed)
     if is_train:
         shuffle = True
         images_per_gpu = args.per_gpu_train_batch_size
@@ -700,9 +703,11 @@ def evaluate(args, val_dataloader, model, tokenizer, output_dir, epoch, dataset=
     caption_file = val_dataloader.dataset.get_caption_file_in_coco_format()
     data = val_dataloader.dataset.yaml_file.split('/')[-2]
     logger.info('Evaluate {}'.format(dataset))
-    result = evaluate_on_coco_caption(predict_file, caption_file, outfile=evaluate_file)
+    result, img2eval = evaluate_on_coco_caption(predict_file, caption_file, outfile=evaluate_file,return_imgscores=True)
     logger.info('evaluation result: {}'.format(str(result)))
     logger.info('evaluation result saved to {}'.format(evaluate_file))
+    with open(evaluate_file.split('.json')[0]+'img2eval.json','w') as f:
+        json.dump(img2eval, f)
     return evaluate_file
 
 
@@ -1089,6 +1094,8 @@ def main():
                 yaml_file = op.join(args.nocaps_evaluate_dir, '{}.yaml'.format(split))
                 val_dataloader['nocaps_{}'.format(split)]=make_data_loader(
                     args, yaml_file, tokenizer, args.distributed, is_train=False)
+                # print('nocaps_{}'.format(split), len(val_dataloader['nocaps_{}'.format(split)].dataset))
+                # input()
         last_checkpoint = train(args, train_dataloader, val_dataloader, model, tokenizer, writer)
 
         # test the last checkpoint after training
