@@ -416,7 +416,7 @@ class CaptionPreTrainedModel(BertPreTrainedModel):
 
         # done sentences
         done = [False for _ in range(batch_size)]
-
+        traces = {'predicted_ids':[],'beam_parent_ids':[],'scores':[]}
         while cur_len < max_length:
             model_inputs = self.prepare_inputs_for_generation(input_ids, past=past)
             outputs = self(**model_inputs)  # (batch_size * num_beams, cur_len, vocab_size)
@@ -539,6 +539,17 @@ class CaptionPreTrainedModel(BertPreTrainedModel):
             input_ids = input_ids[beam_idx, :]
             input_ids = torch.cat([input_ids, beam_words.unsqueeze(1)], dim=-1)
 
+            #traces.append([input_ids.cpu().numpy(),beam_scores.cpu().numpy()])
+            traces['predicted_ids'].append(beam_words.cpu().tolist())
+            traces['scores'].append(beam_scores.cpu().tolist())
+            traces['beam_parent_ids'].append(beam_idx.cpu().tolist())
+            # print(input_ids.cpu().numpy(),beam_scores.cpu().numpy())
+            # print(beam_words.cpu().tolist())
+            # print(beam_scores.cpu().tolist())
+            # print(beam_idx.cpu().tolist())
+            # input()
+            # print(traces[-1])
+            # input()
             # re-order internal states
             if past:
                 reordered_past = []
@@ -594,7 +605,7 @@ class CaptionPreTrainedModel(BertPreTrainedModel):
                 decoded[batch_idx, best_idx, : tgt_len[batch_idx, best_idx] - 1] = hypo
                 decoded[batch_idx, best_idx, tgt_len[batch_idx, best_idx] - 1] = eos_token_ids[0]
 
-        return decoded, logprobs
+        return decoded, logprobs, traces
 
 
 def top_k_top_p_filtering(logits, top_k=0, top_p=1.0, filter_value=-float("Inf"), min_tokens_to_keep=1):

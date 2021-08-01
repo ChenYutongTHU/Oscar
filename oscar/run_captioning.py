@@ -17,20 +17,39 @@ from oscar.utils.tsv_file import TSVFile
 from oscar.utils.tsv_file_ops import (tsv_writer, concat_tsv_files,
         delete_tsv_files, reorder_tsv_keys)
 from oscar.utils.misc import (mkdir, set_seed, 
-        load_from_yaml_file, find_file_path_in_yaml)
+        load_from_yaml_file, find_file_path_in_yaml,
+        draw_position_embeddings)
 from oscar.utils.caption_evaluate import (evaluate_on_coco_caption,
-        ScstRewardCriterion)
-from oscar.utils.cbs import ConstraintFilter, ConstraintBoxesReader
+        ScstRewardCriterion,convert_tsv_to_coco_format)
+from oscar.utils.cbs import ConstraintFilter, ConstraintBoxesReader, load_wordforms
 from oscar.utils.cbs import FiniteStateMachineBuilder
 from oscar.modeling.modeling_bert import BertForImageCaptioning
 from oscar_transformers.pytorch_transformers import BertTokenizer, BertConfig
 from oscar_transformers.pytorch_transformers import AdamW, WarmupLinearSchedule, WarmupConstantSchedule
 from tensorboardX import SummaryWriter
 from oscar.utils.progressbar import ProgressBar
+from kara_storage.abc import Serializer
 import kara_storage
 import struct
 
-class FeatureSerializer(kara_storage.serialization.Serializer):
+class FeatureSerializer(Serializer):
+    def serialize(self, y):
+        ind, x = y
+        num_box = x.shape[0]
+        #print(ind, num_box)
+        #print(struct.pack("I", ind)+struct.pack("I", num_box))
+        return struct.pack("I", ind) + struct.pack("I", num_box) + x.tobytes()
+    
+    def deserialize(self, x):
+        import numpy as np
+        #print(x[:8])
+        ind = struct.unpack("I", x[:4])[0]
+        num_box = struct.unpack("I", x[4:8])[0]
+        #print(ind, num_box)
+        return ind, np.frombuffer(x[8:], np.float32).reshape((num_box, -1))[:]
+
+class FeatureSerializer_old(Serializer):
+    #for version 2.0.4
     def serialize(self, x):
         num_box = x.shape[0]
         return struct.pack("I", num_box) + x.tobytes()
@@ -56,12 +75,12 @@ class CaptionKaraDataset(torch.utils.data.IterableDataset):
             **kwargs):
         self.yaml_file = yaml_file
         self.cfg = load_from_yaml_file(yaml_file)
-        self.storage = kara_storage.KaraStorage(self.cfg['storage_path'])  
-        self.storage_open = self.storage.open(self.cfg['split0'], self.cfg['split1'], 
+        self.storage = kara_storage.KaraStorage(self.cfg['storage_path']) 
+
+        self.storage_open = self.storage.open_dataset(self.cfg['split0'], self.cfg['split1'], 
             "r", serialization=FeatureSerializer())
-        read_wrapper(self.storage_open)
         self.iterable_ImgDataset = kara_storage.make_torch_dataset(self.storage_open, 
-            shuffle=is_train, is_distributed=is_distributed and is_train)
+            shuffle=is_train, auto_distributed=is_distributed and is_train)
 
         #print(len(self.iterable_ImgDataset))
         with open(self.cfg['label_path'],'r') as f:
@@ -158,6 +177,11 @@ class CaptionTensorizer(object):
         tokens_b = self.tokenizer.tokenize(text_b)
         if len(tokens_b) > self.max_seq_len - len(tokens) - 1:
             tokens_b = tokens_b[: (self.max_seq_len - len(tokens) - 1)]
+
+        padded_tokens_b = tokens_b[:]
+        if len(padded_tokens_b) < self.max_seq_len - len(tokens) - 1:
+            padded_tokens_b = padded_tokens_b + [self.tokenizer.pad_token]*(self.max_seq_len - len(tokens) - 1 - len(padded_tokens_b))
+
         tokens += tokens_b + [self.tokenizer.sep_token]
         segment_ids += [sequence_b_segment_id] * (len(tokens_b) + 1)
         seq_len = len(tokens)
@@ -231,11 +255,13 @@ class CaptionTensorizer(object):
 
         input_ids = torch.tensor(input_ids, dtype=torch.long)
         segment_ids = torch.tensor(segment_ids, dtype=torch.long)
+        padded_tokens_b = self.tokenizer.convert_tokens_to_ids(padded_tokens_b)
+        padded_tokens_b = torch.tensor(padded_tokens_b, dtype=torch.long)
 
         if self.is_train:
             masked_ids = torch.tensor(masked_ids, dtype=torch.long)
-            return (input_ids, attention_mask, segment_ids, img_feat, masked_pos, masked_ids)
-        return (input_ids, attention_mask, segment_ids, img_feat, masked_pos)
+            return (input_ids, attention_mask, segment_ids, img_feat, masked_pos, masked_ids,padded_tokens_b)
+        return (input_ids, attention_mask, segment_ids, img_feat, masked_pos,padded_tokens_b)
 
 class CaptionKaraDatasetWithConstraints(CaptionKaraDataset):
     def __init__(
@@ -276,7 +302,7 @@ class CaptionKaraDatasetWithConstraints(CaptionKaraDataset):
             )
             num_constraints = len(candidates)
             fsm, nstates = self._fsm_builder.build(candidates)            
-            yield img_id, example + (fsm, num_constraints, candidates)
+            yield img_id, example[:-1] + (fsm, num_constraints, candidates, example[-1])
 
 
 
@@ -322,7 +348,6 @@ def make_data_loader(args, yaml_file, tokenizer, is_distributed=True,
     dataset = build_dataset(yaml_file, tokenizer, args, 
         is_train=is_train, scst=args.scst, is_distributed=is_distributed)
     if is_train:
-        shuffle = True
         images_per_gpu = args.per_gpu_train_batch_size
         images_per_batch = images_per_gpu * get_world_size()
         #iters_per_batch = len(dataset) // images_per_batch
@@ -331,10 +356,8 @@ def make_data_loader(args, yaml_file, tokenizer, is_distributed=True,
         logger.info("Total batch size {}".format(images_per_batch))
         # logger.info("Total training steps {}".format(num_iters))
     else:
-        shuffle = False
         images_per_gpu = args.per_gpu_eval_batch_size
 
-    #sampler = make_data_sampler(dataset, shuffle, is_distributed)
     data_loader = torch.utils.data.DataLoader(
         dataset, num_workers=args.num_workers, 
         batch_size=images_per_gpu,
@@ -486,11 +509,17 @@ def train(args, train_dataloader, val_dataset, model, tokenizer, writer):
             val_dataset[name].dataset.set_epoch(epoch)
 
         if epoch==start_epoch and is_main_process():
+            checkpoint_dir = save_checkpoint(model, tokenizer, args, epoch, global_step, 
+                optimizer, scheduler, num_trial=10)
+
             if args.evaluate_during_training: 
+                if args.img_embedding_type=='grid' and writer:
+                    draw_position_embeddings(writer, model.module.bert, 
+                        args.grid_n, global_step=global_step, save_dir=args.output_dir)
                 for name in val_dataset:
                     logger.info(name+": Perform evaluation at step: %d epoch %d" % (global_step, epoch))
                     evaluate_file = evaluate(args, val_dataset[name], model, tokenizer,
-                            args.model_name_or_path, epoch-1, dataset=name)
+                            checkpoint_dir, epoch-1, dataset=name)
                     with open(evaluate_file, 'r') as f:
                         res = json.load(f)
                     best_score[name] = max(best_score[name], res['CIDEr'])
@@ -501,10 +530,16 @@ def train(args, train_dataloader, val_dataset, model, tokenizer, writer):
                     with open(args.output_dir + '/eval_logs_{}_{}.json'.format(name, epoch), 'w') as f:
                         json.dump(eval_log[name], f)
                     val_dataset[name].dataset.set_epoch(epoch)
+
+                    if writer:
+                        writer.add_scalar('{}_CIDEr'.format(name), res['CIDEr'], global_step=global_step)
+
         if get_world_size() > 1:
             torch.distributed.barrier()
 
         for step, (img_keys, batch) in enumerate(train_dataloader):
+            tag_tokens = batch[-1]
+            batch = batch[:-1]
             batch = tuple(t.to(args.device) for t in batch)
             #evaluate at the start!
             if not args.scst:
@@ -562,12 +597,16 @@ def train(args, train_dataloader, val_dataset, model, tokenizer, writer):
                         writer.add_scalar('batch_acc', batch_acc, global_step=global_step)
                         writer.add_scalar('lr', optimizer.param_groups[0]["lr"], global_step=global_step)
 
+
         if is_main_process():
             checkpoint_dir = save_checkpoint(model, tokenizer, args, epoch, global_step, 
                 optimizer, scheduler, num_trial=10)
         # evaluation
 
         if args.evaluate_during_training and is_main_process(): 
+            if args.img_embedding_type=='grid' and writer:
+                draw_position_embeddings(writer, model.module.bert, 
+                    args.grid_n, global_step=global_step, save_dir=args.output_dir)
             for name in val_dataset:
                 logger.info(name+": Perform evaluation at step: %d epoch %d" % (global_step, epoch))
                 evaluate_file = evaluate(args, val_dataset[name], model, tokenizer,
@@ -745,16 +784,42 @@ def test(args, test_dataloader, model, tokenizer, predict_file):
     def gen_rows(predict_file):
         time_meter = 0
         id2constraints = {}
+        id2tags = {}
+        id2traces = {}
+
+        with open('select_ids.txt','r') as f:
+            lines = f.readlines()
+            select_ids = [l.strip() for l in lines]
+        #select_ids = []
+        # print(select_ids)
+
+            
+
+
         with torch.no_grad():
             for step, (img_keys, batch) in tqdm(enumerate(test_dataloader)):
-                ## added by yutong to output constrain
+                # added by yutong to output constrain
+                # if not str(img_keys[0]) in select_ids:
+                #     #print(str(img_keys[0]))
+                #     # input()
+                #     yield img_keys[0], json.dumps(({'caption': '', 'conf': 0}))
+                #     continue
+                tag_tokens = batch[-1]
+                batch = batch[:-1]
                 if args.use_cbs:
                     assert args.per_gpu_eval_batch_size==1, args.per_gpu_eval_batch_size
                     constraints = batch[-1]
                     id2constraints[img_keys[0]] = constraints
+                    # print(img_keys[0])
+                    # print('constraints', constraints)
+                    if len(constraints)==0:
+                        yield img_keys[0], json.dumps(({'caption': '', 'conf': 0}))
+                        continue
+
                     batch = batch[:-1]
                     #!!!!
                     #continue
+
                 batch = tuple(t.to(args.device) for t in batch)
                 inputs = {
                     'input_ids': batch[0], 'attention_mask': batch[1],
@@ -776,17 +841,38 @@ def test(args, test_dataloader, model, tokenizer, predict_file):
                 time_meter += time.time() - tic
                 all_caps = outputs[0]  # batch_size * num_keep_best * max_len
                 all_confs = torch.exp(outputs[1])
+                #traces = outputs[2]
 
-                for img_key, caps, confs in zip(img_keys, all_caps, all_confs):
+                #assert args.per_gpu_eval_batch_size ==1
+                #id2traces[img_keys[0].item() if isinstance(img_keys[0], torch.Tensor) else img_keys[0]] = traces
+
+                for img_key, caps, confs, tag_token in zip(img_keys, all_caps, all_confs, tag_tokens):
                     res = []
                     for cap, conf in zip(caps, confs):
                         cap = tokenizer.decode(cap.tolist(), skip_special_tokens=True)
                         res.append({'caption': cap, 'conf': conf.item()})
                     if isinstance(img_key, torch.Tensor):
                         img_key = img_key.item()
+                    id2tags[img_key] = tokenizer.decode(tag_token.tolist(), skip_special_tokens=True)
+
+                    # import pickle
+                    # outputfile = op.join(args.output_dir,\
+                    #     op.splitext(predict_file)[0] + '_{}_traces.pkl'.format(img_key))
+                    # with open(outputfile,'wb') as f:
+                    #     pickle.dump(traces, f)
+
                     yield img_key, json.dumps(res)
+            with open(op.splitext(predict_file)[0] + '_inputtags.json','w') as f:
+                json.dump(id2tags,f)
             with open(op.splitext(predict_file)[0] + '_constraints_{}.json'.format(3),'w') as f:
                 json.dump(id2constraints,f)
+
+            # import pickle
+            # outputfile = op.join(args.output_dir,\
+            #     op.splitext(predict_file)[0] + '_traces.pkl')
+            # with open(outputfile,'wb') as f:
+            #     pickle.dump(id2traces, f)
+
         logger.info("Inference model computing time: {} seconds per batch".format(time_meter / (step+1)))
 
     tsv_writer(gen_rows(predict_file), predict_file)
@@ -828,6 +914,16 @@ def restore_training_settings(args):
         args_load.nocaps_split = args.nocaps_split#.split(',')
         args_load.cap_segment_id = args.cap_segment_id
         args_load.tag_segment_id = args.tag_segment_id
+        if hasattr(args_load, img_embedding_type):
+            assert args_load.img_embedding_type == args.img_embedding_type, \
+                'resumed img_embedding_type {}, load img_embedding_type {}'.format(args_load.img_embedding_type,args.img_embedding_type)
+        args_load.img_embedding_type = args.img_embedding_type
+
+        if hasattr(args_load, grid_n):
+            assert args_load.grid_n == args.grid_n, \
+                'resumed grid_n {}, load grid_n {}'.format(args_load.grid_n,args.grid_n)
+        args_load.grid_n = args.grid_n
+
         if args_load.scst==False:
             logger.info('Inference Override --  ')
             logger.info('max_seq_length {} --> '.format(args_load.max_seq_length))
@@ -1020,6 +1116,11 @@ def main():
     parser.add_argument('--nocaps_split',type=str,default='near,out,in')
     parser.add_argument('--cap_segment_id',type=int,default=1)
     parser.add_argument('--tag_segment_id',type=int,default=0)
+
+    #---image_embedding
+    parser.add_argument('--img_embedding_type', type=str, default='continuous')
+    parser.add_argument('--grid_n', type=int, default=32)
+    parser.add_argument('--perturb_pos', action='store_true')
     args = parser.parse_args()
 
     global logger
@@ -1068,6 +1169,8 @@ def main():
         config.label_smoothing = args.label_smoothing
         config.drop_worst_ratio = args.drop_worst_ratio
         config.drop_worst_after = args.drop_worst_after
+        config.img_embedding_type = args.img_embedding_type
+        config.grid_n = args.grid_n
         model = model_class.from_pretrained(args.model_name_or_path,
                 from_tf=bool('.ckpt' in args.model_name_or_path), config=config)
     else:
@@ -1126,6 +1229,11 @@ def main():
                     None,name)
                 test(args, test_dataloader[name], model, tokenizer, predict_file)
                 logger.info("Prediction {} results saved to: {}".format(name, predict_file))
+                #coco format
+                coco_file = predict_file.replace('.tsv','.coco_format.json')
+                convert_tsv_to_coco_format(predict_file, coco_file)
+                logger.info("Prediction {} results (coco format) saved to: {}".format(name, coco_file))
+
             else: # produce evaluation results
                 evaluate_file = evaluate(args, test_dataloader[name], model, tokenizer,
                         checkpoint, None, dataset=name)

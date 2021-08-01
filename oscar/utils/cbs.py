@@ -166,6 +166,7 @@ class ConstrainedBeamSearch(object):
         ).expand(batch_size, num_fsm_states, num_fsm_states, self.beam_size, vocab_size)
 
         curr_len = curr_ids.shape[1]
+        traces = {'ids':[],'scores':[]}
         for timestep in range(self.max_steps - curr_len - 1):
             # shape: (batch_size * beam_size * num_fsm_states, )
             last_predictions = predictions[-1].reshape(
@@ -176,8 +177,18 @@ class ConstrainedBeamSearch(object):
                 cur_finished = (cur_finished | (last_predictions==eos_token))
             if cur_finished.all():
                 break
-
+            #curr_ids batch_size * num_fsm_states * self.beam_size, *last_dims
             curr_ids = torch.cat([curr_ids, last_predictions.unsqueeze(-1)], dim=1)
+            #curr_ids.shape batch_size*beam_size*num_fsm_states, L
+            #print(curr_ids.shape)
+            curr_ids_ = curr_ids.view(batch_size,num_fsm_states,self.beam_size,-1)
+            # print(curr_ids_.shape) # 1, 32(4*2^3=max_given_constraints), len???
+            # print(curr_ids_[0,:4,:,:])
+            # print(last_log_probabilities.shape)# 1,32, 5
+            # print(last_log_probabilities[0,:4,:])
+            # input()
+            traces['ids'].append(curr_ids_.cpu().numpy())
+            traces['scores'].append(last_log_probabilities.cpu().numpy())
 
             class_logits, state = step(curr_ids, state)
             class_log_probabilities = torch.nn.functional.log_softmax(class_logits, dim=-1)
@@ -270,9 +281,13 @@ class ConstrainedBeamSearch(object):
                     state_beam_log_probs = torch.tensor([x[2] for x in next_batch_beam],
                             device=device).reshape(batch_size, self.beam_size)
 
+
                 restricted_predicted_classes[:, i, :] = state_predicted_classes
                 restricted_beam_indices[:, i, :] = state_beam_indices
                 restricted_beam_log_probs[:, i, :] = state_beam_log_probs
+
+            #print('restricted_predicted_classes')
+            #print(restricted_predicted_classes)
 
             restricted_predicted_classes = restricted_predicted_classes.view(batch_size, -1)
             predictions.append(restricted_predicted_classes)
@@ -298,11 +313,16 @@ class ConstrainedBeamSearch(object):
             # reorder states
             if state is not None:
                 state = tuple(track_back_state(value) for value in state)
-            curr_ids = track_back_state(curr_ids)
+            curr_ids = track_back_state(curr_ids) # trace back , last predictions will be added in the next round
+            
+            #curr_ids_ = curr_ids.view(batch_size,num_fsm_states,-1)
 
+            # print('curr_ids')
+            # print(curr_ids)
+            # input()
         last_predictions = predictions[-1].reshape(
             batch_size * self.beam_size * num_fsm_states
-        )
+        ) #last step
         curr_ids = torch.cat([curr_ids, last_predictions.unsqueeze(-1)], dim=1)
         # Reconstruct the sequences.
         # shape: [(batch_size, beam_size, 1)]
@@ -318,7 +338,7 @@ class ConstrainedBeamSearch(object):
             reconstructed_predictions.append(cur_preds)
 
             # shape: (batch_size, beam_size)
-            cur_backpointers = backpointers[timestep - 1].gather(1, cur_backpointers)
+            cur_backpointers = backpointers[timestep - 1].gather(1, cur_backpointers) # trace back?
 
         # shape: (batch_size, beam_size, 1)
         final_preds = predictions[0].gather(1, cur_backpointers).unsqueeze(2)
@@ -326,8 +346,12 @@ class ConstrainedBeamSearch(object):
         reconstructed_predictions.append(final_preds)
 
         # shape: (batch_size, beam_size, max_steps)
-        all_predictions = torch.cat(list(reversed(reconstructed_predictions)), 2)
+        all_predictions = torch.cat(list(reversed(reconstructed_predictions)), 2) #trace back
         all_predictions = all_predictions.view(batch_size, num_fsm_states, self.beam_size, -1)
+
+        traces['ids'].append(curr_ids_.cpu().numpy())
+        traces['scores'].append(last_log_probabilities.cpu().numpy())
+        traces['all_predictions'] = all_predictions.cpu().numpy()
         assert (all_predictions == curr_ids.reshape(batch_size, num_fsm_states,
                 self.beam_size, -1)[:,:,:,1:]).all()
 
@@ -360,7 +384,7 @@ class ConstrainedBeamSearch(object):
                     pad_len).fill_(self._eos_token_ids[0])
             all_predictions = torch.cat([all_predictions, padding_ids], dim=-1)
 
-        return all_predictions, last_log_probabilities
+        return all_predictions, last_log_probabilities, traces
 
 
 def select_best_beam_with_constraints(

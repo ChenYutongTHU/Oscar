@@ -159,6 +159,9 @@ class BertImgModel(BertPreTrainedModel):
         self.img_dim = config.img_feature_dim
         logger.info('BertImgModel Image Dimension: {}'.format(self.img_dim))
         self.img_feature_type = config.img_feature_type
+        self.img_embedding_type = config.img_embedding_type
+        self.grid_n = config.grid_n
+
         if hasattr(config, 'use_img_layernorm'):
             self.use_img_layernorm = config.use_img_layernorm
         else:
@@ -175,7 +178,16 @@ class BertImgModel(BertPreTrainedModel):
             self.code_embeddings = nn.Embedding(config.code_voc, config.code_dim, padding_idx=0)
             self.img_embedding = nn.Linear(config.code_dim, self.config.hidden_size, bias=True)
         else:
-            self.img_embedding = nn.Linear(self.img_dim, self.config.hidden_size, bias=True)
+            if self.img_embedding_type=='continuous':
+                self.img_embedding = nn.Linear(self.img_dim, self.config.hidden_size, bias=True)
+            elif self.img_embedding_type=='grid':
+                self.img_embedding_feature = nn.Linear(self.img_dim-6, self.config.hidden_size, bias=True)
+                self.img_embedding_width = nn.Embedding(260, self.config.hidden_size)
+                self.img_embedding_height = nn.Embedding(260, self.config.hidden_size)
+                self.img_embedding_cx = nn.Embedding(260, self.config.hidden_size)
+                self.img_embedding_cy = nn.Embedding(260, self.config.hidden_size)
+            else: #None
+                self.img_embedding = nn.Linear(self.img_dim-6, self.config.hidden_size, bias=True)
             self.dropout = nn.Dropout(config.hidden_dropout_prob)
             if self.use_img_layernorm:
                 self.LayerNorm = BertLayerNorm(config.hidden_size, eps=config.img_layer_norm_eps)
@@ -195,6 +207,11 @@ class BertImgModel(BertPreTrainedModel):
         """
         for layer, heads in heads_to_prune.items():
             self.encoder.layer[layer].attention.prune_heads(heads)
+
+    def quantization(self, u):
+        #B,L,N ((x1+x2/2,y1+y2/2,w,h))
+
+        return torch.floor(u*self.grid_n).long()
 
     def forward(self, input_ids, token_type_ids=None, attention_mask=None,
             position_ids=None, head_mask=None, img_feats=None,
@@ -257,8 +274,25 @@ class BertImgModel(BertPreTrainedModel):
             elif self.img_feature_type == 'dis_code_scale': # left scaled
                 code_emb = self.code_embeddings(img_feats)
                 img_embedding_output = self.img_embedding(code_emb)
-            else:
-                img_embedding_output = self.img_embedding(img_feats)
+            else: #b，l，-6: （x1,x2,y1,y2,w,h）
+                if self.img_embedding_type=='continuous':
+                    img_embedding_output = self.img_embedding(img_feats)
+                elif self.img_embedding_type=='grid':
+                    region_feats = img_feats[:,:,:-6]
+                    pos_feats = img_feats[:,:,-6:] #x1,y1,x2,y2,w,h
+                    center_x = (pos_feats[:,:,0]+pos_feats[:,:,2])/2
+                    center_y = (pos_feats[:,:,1]+pos_feats[:,:,3])/2
+                    width, height = pos_feats[:,:,4], pos_feats[:,:,5]
+
+                    region_embedding = self.img_embedding_feature(region_feats)
+                    cx_embedding = self.img_embedding_cx(self.quantization(center_x))
+                    cy_embedding = self.img_embedding_cy(self.quantization(center_y))
+                    w_embedding = self.img_embedding_width(self.quantization(width))
+                    h_embedding = self.img_embedding_height(self.quantization(height))
+                    img_embedding_output = region_embedding+cx_embedding+cy_embedding+w_embedding+h_embedding
+                else: #None
+                    img_embedding_output = self.img_embedding(img_feats[:,:,:-6])
+
                 if self.use_img_layernorm:
                     img_embedding_output = self.LayerNorm(img_embedding_output)
 
@@ -878,7 +912,7 @@ class BertForImageCaptioning(CaptionPreTrainedModel):
             assert self.num_keep_best == 1, 'not supported n_best > 1 for CBS'
             searcher = ConstrainedBeamSearch(eos_token_ids, max_length,
                     num_beams)
-            curr_ids, sum_logprobs = searcher.search(
+            curr_ids, sum_logprobs, traces = searcher.search(
                     input_ids,
                     None,
                     self._decode_step,
@@ -892,7 +926,7 @@ class BertForImageCaptioning(CaptionPreTrainedModel):
                 eos_token_ids,
             )
             # (batch_size, n_best, max_len), (batch_size, n_best)
-            output = (curr_ids.unsqueeze(1), logprobs.unsqueeze(1))
+            output = (curr_ids.unsqueeze(1), logprobs.unsqueeze(1), traces)
 
         return output
 

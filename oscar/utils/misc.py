@@ -8,7 +8,7 @@ import random
 import torch
 import numpy as np
 import torch.distributed as dist
-
+import matplotlib.pyplot as plt
 
 def mkdir(path):
     # if it is the current folder, skip.
@@ -19,6 +19,32 @@ def mkdir(path):
     except OSError as e:
         if e.errno != errno.EEXIST:
             raise
+
+def cosine_similarity(arr): #N,d
+    #normalize
+    eps = 1e-10
+    norm = np.sqrt(np.sum(arr*arr, axis=1,keepdims=True))+eps
+    arr = arr/norm
+    cos = np.dot(arr, np.transpose(arr))
+    return cos
+
+def draw_position_embeddings(writer, model, N, global_step, save_dir=None):
+    if not save_dir:
+        save_dir = op.join(save_dir, 'grid_embeddings')
+        mkdir(save_dir)
+
+    for name in ['width','height','cx','cy']:
+        embed_name = 'img_embedding_{}'.format(name)
+        embedding = getattr(model,embed_name)
+        tensor = embedding.weight
+        arr = tensor.detach().cpu().numpy()
+        sim = cosine_similarity(arr[:N,])
+        fig, ax = plt.subplots()
+        ax.matshow(sim)
+        writer.add_figure(embed_name,fig,global_step=global_step)
+        fig.savefig(op.join(save_dir, '{}_{}.png'.format(embed_name, global_step)))
+    return 
+
 
 
 def set_seed(seed, n_gpu):
