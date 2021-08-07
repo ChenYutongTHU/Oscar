@@ -28,17 +28,18 @@ def cosine_similarity(arr): #N,d
     cos = np.dot(arr, np.transpose(arr))
     return cos
 
-def draw_position_embeddings(writer, model, N, global_step, save_dir=None):
+def draw_position_embeddings(writer, model, N, global_step, grid_factor, save_dir=None):
     if not save_dir:
         save_dir = op.join(save_dir, 'grid_embeddings')
         mkdir(save_dir)
 
-    for name in ['width','height','cx','cy']:
+    for name in grid_factor:
         embed_name = 'img_embedding_{}'.format(name)
         embedding = getattr(model,embed_name)
         tensor = embedding.weight
         arr = tensor.detach().cpu().numpy()
-        sim = cosine_similarity(arr[:N,])
+        N_ = N*2 if name=='area' else N
+        sim = cosine_similarity(arr[:N_,])
         fig, ax = plt.subplots()
         ax.matshow(sim)
         writer.add_figure(embed_name,fig,global_step=global_step)

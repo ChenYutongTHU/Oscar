@@ -161,6 +161,7 @@ class BertImgModel(BertPreTrainedModel):
         self.img_feature_type = config.img_feature_type
         self.img_embedding_type = config.img_embedding_type
         self.grid_n = config.grid_n
+        self.grid_factor = config.grid_factor
 
         if hasattr(config, 'use_img_layernorm'):
             self.use_img_layernorm = config.use_img_layernorm
@@ -182,10 +183,16 @@ class BertImgModel(BertPreTrainedModel):
                 self.img_embedding = nn.Linear(self.img_dim, self.config.hidden_size, bias=True)
             elif self.img_embedding_type=='grid':
                 self.img_embedding_feature = nn.Linear(self.img_dim-6, self.config.hidden_size, bias=True)
-                self.img_embedding_width = nn.Embedding(260, self.config.hidden_size)
-                self.img_embedding_height = nn.Embedding(260, self.config.hidden_size)
-                self.img_embedding_cx = nn.Embedding(260, self.config.hidden_size)
-                self.img_embedding_cy = nn.Embedding(260, self.config.hidden_size)
+                if 'width' in self.grid_factor:
+                    self.img_embedding_width = nn.Embedding(260, self.config.hidden_size)
+                if 'height' in self.grid_factor:
+                    self.img_embedding_height = nn.Embedding(260, self.config.hidden_size)
+                if 'cx' in self.grid_factor:
+                    self.img_embedding_cx = nn.Embedding(260, self.config.hidden_size)
+                if 'cy' in self.grid_factor:
+                    self.img_embedding_cy = nn.Embedding(260, self.config.hidden_size)
+                if 'area' in self.grid_factor:
+                    self.img_embedding_area = nn.Embedding(260, self.config.hidden_size) #n 9*9=81
             else: #None
                 self.img_embedding = nn.Linear(self.img_dim-6, self.config.hidden_size, bias=True)
             self.dropout = nn.Dropout(config.hidden_dropout_prob)
@@ -208,9 +215,10 @@ class BertImgModel(BertPreTrainedModel):
         for layer, heads in heads_to_prune.items():
             self.encoder.layer[layer].attention.prune_heads(heads)
 
-    def quantization(self, u):
+    def quantization(self, u, is_area=False):
         #B,L,N ((x1+x2/2,y1+y2/2,w,h))
-
+        if is_area:
+            return torch.floor(u*self.grid_n*2).long()
         return torch.floor(u*self.grid_n).long()
 
     def forward(self, input_ids, token_type_ids=None, attention_mask=None,
@@ -283,13 +291,24 @@ class BertImgModel(BertPreTrainedModel):
                     center_x = (pos_feats[:,:,0]+pos_feats[:,:,2])/2
                     center_y = (pos_feats[:,:,1]+pos_feats[:,:,3])/2
                     width, height = pos_feats[:,:,4], pos_feats[:,:,5]
-
+                    area = width*height
                     region_embedding = self.img_embedding_feature(region_feats)
-                    cx_embedding = self.img_embedding_cx(self.quantization(center_x))
-                    cy_embedding = self.img_embedding_cy(self.quantization(center_y))
-                    w_embedding = self.img_embedding_width(self.quantization(width))
-                    h_embedding = self.img_embedding_height(self.quantization(height))
-                    img_embedding_output = region_embedding+cx_embedding+cy_embedding+w_embedding+h_embedding
+                    img_embedding_output = region_embedding
+                    if 'cx' in self.grid_factor:
+                        cx_embedding = self.img_embedding_cx(self.quantization(center_x))
+                        img_embedding_output += cx_embedding
+                    if 'cy' in self.grid_factor:
+                        cy_embedding = self.img_embedding_cy(self.quantization(center_y))
+                        img_embedding_output += cy_embedding
+                    if 'width' in self.grid_factor:
+                        w_embedding = self.img_embedding_width(self.quantization(width))
+                        img_embedding_output += w_embedding
+                    if 'height' in self.grid_factor:
+                        h_embedding = self.img_embedding_height(self.quantization(height))
+                        img_embedding_output += h_embedding
+                    if 'area' in self.grid_factor:
+                        area_embedding = self.img_embedding_area(self.quantization(area, is_area=True))
+                        img_embedding_output += area_embedding                       
                 else: #None
                     img_embedding_output = self.img_embedding(img_feats[:,:,:-6])
 
