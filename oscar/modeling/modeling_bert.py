@@ -152,6 +152,7 @@ class BertImgModel(BertPreTrainedModel):
     """
     def __init__(self, config):
         super(BertImgModel, self).__init__(config)
+        self.config = config
         self.embeddings = BertEmbeddings(config)
         self.encoder = CaptionBertEncoder(config)
         self.pooler = BertPooler(config)
@@ -162,6 +163,7 @@ class BertImgModel(BertPreTrainedModel):
         self.img_embedding_type = config.img_embedding_type
         self.grid_n = config.grid_n
         self.grid_factor = config.grid_factor
+        self.use_match = config.use_match
 
         if hasattr(config, 'use_img_layernorm'):
             self.use_img_layernorm = config.use_img_layernorm
@@ -199,6 +201,9 @@ class BertImgModel(BertPreTrainedModel):
             if self.use_img_layernorm:
                 self.LayerNorm = BertLayerNorm(config.hidden_size, eps=config.img_layer_norm_eps)
 
+        if self.use_match:
+            self.match_fc = nn.Linear(self.config.hidden_size*2, self.config.hidden_size, bias=True)
+
         self.apply(self.init_weights)
 
     def _resize_token_embeddings(self, new_num_tokens):
@@ -221,8 +226,8 @@ class BertImgModel(BertPreTrainedModel):
             return torch.floor(u*self.grid_n*2).long()
         return torch.floor(u*self.grid_n).long()
 
-    def forward(self, input_ids, token_type_ids=None, attention_mask=None,
-            position_ids=None, head_mask=None, img_feats=None,
+    def forward(self, input_ids, word_len=None, token_type_ids=None, attention_mask=None,
+            position_ids=None, head_mask=None, img_feats=None, match_ids = None,
             encoder_history_states=None):
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids)
@@ -270,7 +275,7 @@ class BertImgModel(BertPreTrainedModel):
                 token_type_ids=token_type_ids)
         if encoder_history_states:
             assert img_feats is None, "Cannot take image features while using encoder history states"
-
+            assert match_ids is None, "Cannot take match while using encoder history states"
         if img_feats is not None:
             if self.img_feature_type == 'dis_code':
                 code_emb = self.code_embeddings(img_feats)
@@ -318,9 +323,32 @@ class BertImgModel(BertPreTrainedModel):
                 # add dropout on image embedding
                 img_embedding_output = self.dropout(img_embedding_output)
 
-            # concatenate two embeddings
-            embedding_output = torch.cat((embedding_output, img_embedding_output), 1)
+            # concatenate two embeddings #  B(l1+l2+l3),d
+            if self.use_match:
+                #match [B, L ,2] #gather from embedding_output, img_embedding_output
+                def gather(src, ind, offset):
+                    #ind B,L,1
+                    B,Ls,dim = src.shape 
+                    ind = ind + offset
+                    Lt = ind.shape[1]
+                    assert ind.dim()==2 # B,Lt
+                    assert ind.max()<src.shape[1], (ind.max(), src.shape)
+                    ind = ind.unsqueeze(-1).repeat([1,1,dim]) # B,Lt,dim
+                    tgt = torch.gather(input=src, dim=1, index=ind)
+                    assert tgt.shape == torch.Size([B,Lt,dim])
+                    return tgt 
 
+                if word_len==None:  
+                    word_len = self.config.max_seq_a_len
+                words = gather(embedding_output, match_ids[:,:,0], offset=word_len);
+                regions = gather(img_embedding_output, match_ids[:,:,1], offset=0);
+                match_embedding = self.match_fc(torch.cat([words, regions], -1)) #B, lt,2*dim
+                embedding_output = torch.cat((embedding_output, img_embedding_output, match_embedding), 1)
+            else:
+                embedding_output = torch.cat((embedding_output, img_embedding_output), 1)
+
+
+        #print('head_mask', head_mask.shape)
         encoder_outputs = self.encoder(embedding_output,
                 extended_attention_mask, head_mask=head_mask,
                 encoder_history_states=encoder_history_states)
@@ -333,7 +361,7 @@ class BertImgModel(BertPreTrainedModel):
 
 
 def instance_bce_with_logits(logits, labels, reduction='mean'):
-    assert logits.dim() == 2
+    assert lBertImgModelogits.dim() == 2
     loss = F.binary_cross_entropy_with_logits(logits, labels, reduction=reduction)
     if reduction == 'mean':
         loss *= labels.size(1)
@@ -685,10 +713,13 @@ class BertForImageCaptioning(CaptionPreTrainedModel):
             return self.encode_forward(*args, **kwargs)
 
     def encode_forward(self, input_ids, img_feats, attention_mask, masked_pos, masked_ids=None, 
-            token_type_ids=None, position_ids=None, head_mask=None,
+            word_len=None,
+            token_type_ids=None, position_ids=None, head_mask=None, match_ids=None,
             is_training=True, encoder_history_states=None):
         outputs = self.bert(input_ids, img_feats=img_feats, attention_mask=attention_mask, 
+                word_len=word_len,
                 position_ids=position_ids, token_type_ids=token_type_ids,
+                match_ids=match_ids,
                 head_mask=head_mask,
                 encoder_history_states=encoder_history_states)
         sequence_output = outputs[0][:, :masked_pos.shape[-1], :]
@@ -732,7 +763,7 @@ class BertForImageCaptioning(CaptionPreTrainedModel):
             input_ids = torch.cat([curr_ids, mask_ids], dim=1)
 
             curr_len = input_ids.shape[1]
-            full_len = self.max_seq_len + self.od_labels_len + self.img_seq_len
+            full_len = self.max_seq_len + self.od_labels_len + self.img_seq_len + self.match_seq_len
             assert self.full_attention_mask.shape == (batch_size,
                     full_len, full_len)
 
@@ -748,7 +779,7 @@ class BertForImageCaptioning(CaptionPreTrainedModel):
                 return res
 
             seq_start = curr_len
-            seq_end = self.max_seq_len
+            seq_end = self.max_seq_len #length of caption length
             attention_mask = _remove_rows_cols(self.full_attention_mask, seq_start,
                     seq_end, seq_start, seq_end)
 
@@ -756,7 +787,8 @@ class BertForImageCaptioning(CaptionPreTrainedModel):
             token_type_ids = _remove_elements(self.full_token_type_ids, seq_start, seq_end)
             position_ids = _remove_elements(self.full_position_ids, seq_start, seq_end)
             img_feats = self.img_feats
-
+            match_ids = self.match_ids
+            word_len = input_ids.shape[1]
             if self.add_od_labels:
                 assert self.od_label_ids.shape[1] == self.od_labels_len
                 input_ids = torch.cat([input_ids, self.od_label_ids], dim=1)
@@ -772,11 +804,12 @@ class BertForImageCaptioning(CaptionPreTrainedModel):
             position_ids = _slice(self.full_position_ids, start_pos, end_pos)
 
             img_feats = None
+            match_ids = None
             assert past[0].shape[0] == batch_size
             if self.prev_encoded_layers is None:
                 assert start_pos == 1  # the first token after BOS
-                assert past[0].shape[1] == 2 + self.od_labels_len + self.img_seq_len
-                # reorder to [od_labels, img_feats, sentence]
+                assert past[0].shape[1] == 2 + self.od_labels_len + self.img_seq_len + self.match_seq_len
+                # reorder to [od_labels, img_feats, match, sentence]
                 self.prev_encoded_layers = [
                         torch.cat([x[:, 2:, :], x[:, :start_pos,:]], dim=1)
                         for x in past]
@@ -799,10 +832,12 @@ class BertForImageCaptioning(CaptionPreTrainedModel):
                         for x, p in zip(self.prev_encoded_layers, past)]
 
             attention_mask = self.full_attention_mask[:,
-                self.od_labels_len+self.img_seq_len+start_pos: self.od_labels_len+self.img_seq_len+end_pos,
-                :self.od_labels_len+self.img_seq_len+end_pos]
+                self.od_labels_len+self.img_seq_len+self.match_seq_len+start_pos: self.od_labels_len+self.img_seq_len+self.match_seq_len+end_pos,
+                :self.od_labels_len+self.img_seq_len+self.match_seq_len+end_pos]
 
-        return {'input_ids': input_ids, 'img_feats': img_feats,
+        return {'input_ids': input_ids, 'word_len':word_len,
+            'img_feats': img_feats,
+            'match_ids': match_ids,
             'masked_pos': masked_pos, 'attention_mask': attention_mask,
             'token_type_ids': token_type_ids, 'position_ids': position_ids,
             'is_training': False,
@@ -812,7 +847,8 @@ class BertForImageCaptioning(CaptionPreTrainedModel):
         return self.decoder
 
     def generate(self, img_feats, attention_mask, masked_pos, token_type_ids=None,
-            position_ids=None, head_mask=None, input_ids=None, max_length=None,
+            position_ids=None, head_mask=None, input_ids=None, match_ids=None,
+            max_length=None,
             do_sample=None, num_beams=None, temperature=None, top_k=None, top_p=None,
             repetition_penalty=None, bos_token_id=None, pad_token_id=None,
             eos_token_ids=None, mask_token_id=None, length_penalty=None,
@@ -828,6 +864,7 @@ class BertForImageCaptioning(CaptionPreTrainedModel):
         assert is_decode
         batch_size = img_feats.shape[0]
         self.img_seq_len = img_feats.shape[1]
+        self.match_seq_len = match_ids.shape[1] if self.config.use_match else 0
         self.max_seq_len = max_length
         self.mask_token_id = mask_token_id
         self.prev_encoded_layers = None
@@ -889,6 +926,7 @@ class BertForImageCaptioning(CaptionPreTrainedModel):
         num_expand = num_beams * num_fsm_states * num_return_sequences
         self.od_label_ids = self._expand_for_beams(od_label_ids, num_expand)
         self.img_feats = self._expand_for_beams(img_feats, num_expand)
+        self.match_ids = self._expand_for_beams(match_ids, num_expand)
         self.full_attention_mask = self._expand_for_beams(attention_mask, num_expand)
         self.full_masked_pos = self._expand_for_beams(masked_pos, num_expand)
         self.full_token_type_ids = self._expand_for_beams(token_type_ids, num_expand)

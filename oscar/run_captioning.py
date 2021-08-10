@@ -72,6 +72,7 @@ class CaptionKaraDataset(torch.utils.data.IterableDataset):
     def __init__(self, yaml_file, tokenizer=None, add_od_labels=True,
             max_img_seq_length=50, max_seq_length=70, max_seq_a_length=40, 
             is_train=True, mask_prob=0.15, max_masked_tokens=3, scst=False, is_distributed=False,
+            match_threshold=1,
             **kwargs):
         self.yaml_file = yaml_file
         self.cfg = load_from_yaml_file(yaml_file)
@@ -80,8 +81,8 @@ class CaptionKaraDataset(torch.utils.data.IterableDataset):
         self.storage_open = self.storage.open_dataset(self.cfg['split0'], self.cfg['split1'], 
             "r", serialization=FeatureSerializer())
         self.iterable_ImgDataset = kara_storage.make_torch_dataset(self.storage_open, 
-            shuffle=is_train, auto_distributed=is_distributed and is_train)
-
+            shuffle=False, auto_distributed=is_distributed and is_train) #shuffle!
+ 
         #print(len(self.iterable_ImgDataset))
         with open(self.cfg['label_path'],'r') as f:
             self.labels = json.load(f)  #[id,[labels]], [id, [labels],[id,[labels]]]
@@ -99,6 +100,15 @@ class CaptionKaraDataset(torch.utils.data.IterableDataset):
         else:
             self.captions = None
             self.key2captions = None
+
+        if 'match_path' in self.cfg:
+            with open(self.cfg['match_path'],'r') as f:
+                self.match = json.load(f)
+                self.match_threshold = match_threshold
+        else:
+            self.match = None
+            self.match_threshold = 1
+
         self.tokenizer = tokenizer
 
         self.is_train = is_train 
@@ -120,7 +130,9 @@ class CaptionKaraDataset(torch.utils.data.IterableDataset):
                 caps = None
             example = self.tensorizer.tensorize_example(text_a=caps, text_b=od_labels, img_feat=torch.Tensor(features),
                 sequence_a_segment_id=self.kwargs['cap_segment_id'], 
-                sequence_b_segment_id=self.kwargs['tag_segment_id'])  #tag -> 0 caption -> 1
+                sequence_b_segment_id=self.kwargs['tag_segment_id'],
+                match=self.match[img_id],
+                match_threshold=self.match_threshold)  #tag -> 0 caption -> 1
             yield img_id, example
 
     def set_epoch(self, epoch):
@@ -149,16 +161,34 @@ class CaptionTensorizer(object):
         self.max_img_seq_len = max_img_seq_length
         self.max_seq_len = max_seq_length
         self.max_seq_a_len = max_seq_a_length
+        #print('max_seq_a_len', self.max_seq_a_len)
         self.mask_prob = mask_prob
         self.max_masked_tokens = max_masked_tokens
         self.is_train = is_train
         self._triangle_mask = torch.tril(torch.ones((self.max_seq_len, 
             self.max_seq_len), dtype=torch.long))
 
+    def tokenize_tags(self, tags, max_seq_len):
+        assert type(tags) == list
+        tokens = []
+        segments = []
+        #pt = 1 #take cls into accountß
+        pt=0
+        tags_valid = []
+        for t in tags:
+            tokens_ = self.tokenizer.tokenize(t)
+            if len(tokens)+len(tokens_)>max_seq_len:
+                break
+            segments.append([pt, pt+len(tokens_)])
+            pt = pt+len(tokens_)
+            tokens.extend(tokens_)
+            tags_valid.append(t)
+        return tokens, segments, tags_valid
 
 
     def tensorize_example(self, text_a, text_b, img_feat,  #a caption; b tag
-            cls_token_segment_id=0, pad_token_segment_id=0, sequence_a_segment_id=1, sequence_b_segment_id=0):
+            cls_token_segment_id=0, pad_token_segment_id=0, sequence_a_segment_id=1, sequence_b_segment_id=0,
+            match=None, match_threshold=1):
         if self.is_train:
             tokens_a = self.tokenizer.tokenize(text_a)
         else:
@@ -173,14 +203,44 @@ class CaptionTensorizer(object):
         tokens += [self.tokenizer.pad_token] * padding_a_len
         segment_ids += ([pad_token_segment_id] * padding_a_len)
 
-        text_b = ' '.join(text_b)
-        tokens_b = self.tokenizer.tokenize(text_b)
+        #text_b = ' '.join(text_b)
+        #tokens_b = self.tokenizer.tokenize(text_b)
+
+        self.max_tag_len = self.max_seq_len - len(tokens) - 1
+        tokens_b, segments, tags_valid = self.tokenize_tags(text_b, self.max_seq_len - len(tokens) - 1)
+        #segments len(segments)<=self.max_seq_len - len(tokens) - 1
+        assert len(tokens_b) <= self.max_seq_len - len(tokens) - 1
         if len(tokens_b) > self.max_seq_len - len(tokens) - 1:
             tokens_b = tokens_b[: (self.max_seq_len - len(tokens) - 1)]
 
         padded_tokens_b = tokens_b[:]
+        self.tag_len = len(tokens_b)
         if len(padded_tokens_b) < self.max_seq_len - len(tokens) - 1:
             padded_tokens_b = padded_tokens_b + [self.tokenizer.pad_token]*(self.max_seq_len - len(tokens) - 1 - len(padded_tokens_b))
+
+        #match [[tag,tag_id->segment,region_id]]
+        assert match!=None
+        match_ids = []
+        offset = 0#len(tokens) we plus offset in model forwarding (adapting to len(input_lens))
+        #print('offset', len(tokens), self.max_seq_a_len)
+        for ii, (seg, m, t) in enumerate(zip(segments, match[:len(segments)], tags_valid)): 
+            if not m[0]==t:
+                for jj, (m_,t_,tb) in enumerate(zip(match, tags_valid, text_b)):
+                    print(jj, m_[0], t_,tb)
+            assert m[0]==t, (m[0],t,i)
+
+            if not m[-1]>match_threshold or m[2]>=self.max_img_seq_len:
+                continue
+            s, t = seg
+            #assert s==len(match_ids), segments 
+            for i in range(s,t):
+                match_ids.append([i+offset, m[2]]) # m [tag, tag_id, region_id, region_iou]
+        #padding
+        self.match_len = len(match_ids)
+        if len(match_ids) < self.max_tag_len:
+            match_ids = match_ids + \
+                [[0,0]]*(self.max_tag_len- len(match_ids))  #-1,-1??
+
 
         tokens += tokens_b + [self.tokenizer.sep_token]
         segment_ids += [sequence_b_segment_id] * (len(tokens_b) + 1)
@@ -235,33 +295,49 @@ class CaptionTensorizer(object):
                                           img_feat.shape[1]))
             img_feat = torch.cat((img_feat, padding_matrix), 0)
 
-        max_len = self.max_seq_len + self.max_img_seq_len
+        if match_threshold<1:
+            max_len = self.max_seq_len + self.max_img_seq_len + self.max_tag_len
+        else:
+            max_len = self.max_seq_len + self.max_img_seq_len
+            self.match_len = 0
         attention_mask = torch.zeros((max_len, max_len), dtype=torch.long)
-        # C: caption, L: label, R: image region
+        # C: caption, L: label, R: image region, M:match
         c_start, c_end = 0, seq_a_len
         l_start, l_end = self.max_seq_a_len, seq_len
         r_start, r_end = self.max_seq_len, self.max_seq_len + img_len
+        m_start, m_end = self.max_seq_len + self.max_img_seq_len, self.max_seq_len + self.max_img_seq_len + self.match_len
         # triangle mask for caption to caption
         attention_mask[c_start : c_end, c_start : c_end].copy_(self._triangle_mask[0 : seq_a_len, 0 : seq_a_len])
-        # full attention for L-L, R-R
-        attention_mask[l_start : l_end, l_start : l_end] = 1
-        attention_mask[r_start : r_end, r_start : r_end] = 1
-        # full attention for C-L, C-R
+        # full attention for C-L, C-R, C-M
         attention_mask[c_start : c_end, l_start : l_end] = 1
         attention_mask[c_start : c_end, r_start : r_end] = 1
-        # full attention for L-R:
+        attention_mask[c_start : c_end, m_start : m_end] = 1
+        # full attention for L-L, L-R, L-M
+        attention_mask[l_start : l_end, l_start : l_end] = 1
         attention_mask[l_start : l_end, r_start : r_end] = 1
+        attention_mask[l_start : l_end, m_start : m_end] = 1
+        # full attention for R-L, R-R, R-M
         attention_mask[r_start : r_end, l_start : l_end] = 1
+        attention_mask[r_start : r_end, r_start : r_end] = 1
+        attention_mask[r_start : r_end, m_start : m_end] = 1        
+        # full attention for M-L, M-R, M-M
+        attention_mask[m_start : m_end, l_start : l_end] = 1
+        attention_mask[m_start : m_end, r_start : r_end] = 1
+        attention_mask[m_start : m_end, m_start : m_end] = 1
+
 
         input_ids = torch.tensor(input_ids, dtype=torch.long)
         segment_ids = torch.tensor(segment_ids, dtype=torch.long)
         padded_tokens_b = self.tokenizer.convert_tokens_to_ids(padded_tokens_b)
         padded_tokens_b = torch.tensor(padded_tokens_b, dtype=torch.long)
 
+        match_ids = torch.tensor(match_ids, dtype=torch.long)
+
+
         if self.is_train:
             masked_ids = torch.tensor(masked_ids, dtype=torch.long)
-            return (input_ids, attention_mask, segment_ids, img_feat, masked_pos, masked_ids,padded_tokens_b)
-        return (input_ids, attention_mask, segment_ids, img_feat, masked_pos,padded_tokens_b)
+            return (input_ids, attention_mask, segment_ids, img_feat, masked_pos, masked_ids,padded_tokens_b, match_ids)
+        return (input_ids, attention_mask, segment_ids, img_feat, masked_pos,padded_tokens_b, match_ids)
 
 class CaptionKaraDatasetWithConstraints(CaptionKaraDataset):
     def __init__(
@@ -321,7 +397,7 @@ def build_dataset(yaml_file, tokenizer, args, is_train=True, scst=False, is_dist
             max_seq_length=args.max_seq_length, max_seq_a_length=args.max_seq_a_length,
             is_train=True, mask_prob=args.mask_prob, max_masked_tokens=args.max_masked_tokens,
             cap_segment_id=args.cap_segment_id, tag_segment_id=args.tag_segment_id, scst=scst,
-            is_distributed=is_distributed)
+            is_distributed=is_distributed, match_threshold=args.match_threshold)
     if args.use_cbs:
         dataset_class = CaptionKaraDatasetWithConstraints
     else:
@@ -330,7 +406,7 @@ def build_dataset(yaml_file, tokenizer, args, is_train=True, scst=False, is_dist
             add_od_labels=args.add_od_labels, max_img_seq_length=args.max_img_seq_length,
             max_seq_length=args.max_seq_length, max_seq_a_length=args.max_gen_length,
             is_train=is_train, cap_segment_id=args.cap_segment_id, tag_segment_id=args.tag_segment_id,
-            scst=scst, is_distributed=is_distributed)
+            scst=scst, is_distributed=is_distributed, match_threshold=args.match_threshold)
 
 
 def make_data_sampler(dataset, shuffle, distributed):
@@ -512,6 +588,7 @@ def train(args, train_dataloader, val_dataset, model, tokenizer, writer):
             checkpoint_dir = save_checkpoint(model, tokenizer, args, epoch, global_step, 
                 optimizer, scheduler, num_trial=10)
 
+            
             if args.evaluate_during_training: 
                 if args.img_embedding_type=='grid' and writer:
                     draw_position_embeddings(writer, model.module.bert, 
@@ -533,24 +610,33 @@ def train(args, train_dataloader, val_dataset, model, tokenizer, writer):
 
                     if writer:
                         writer.add_scalar('{}_CIDEr'.format(name), res['CIDEr'], global_step=global_step)
+             
 
         if get_world_size() > 1:
             torch.distributed.barrier()
 
         for step, (img_keys, batch) in enumerate(train_dataloader):
-            tag_tokens = batch[-1]
-            batch = batch[:-1]
+            tag_tokens, match_ids = batch[-2], batch[-1]
+            # print(img_keys[0])
+            # print(tag_tokens[0])
+            # print(match_ids[0])
+
+            #input()
+            #batch = batch[:-2]
             batch = tuple(t.to(args.device) for t in batch)
             #evaluate at the start!
             if not args.scst:
                 model.train()
                 inputs = {'input_ids': batch[0], 'attention_mask': batch[1],
                     'token_type_ids': batch[2], 'img_feats': batch[3], 
-                    'masked_pos': batch[4], 'masked_ids': batch[5]
+                    'masked_pos': batch[4], 'masked_ids': batch[5],
+                    'match_ids': batch[7]
                 }
-                # torch.set_printoptions(profile="full")
+                torch.set_printoptions(profile="full")
                 # print(img_keys[0])
                 # print('input_ids', inputs['input_ids'][0])
+                # print('attention_mask', inputs['attention_mask'][0])
+                # input()
                 # print('token_type_ids',inputs['token_type_ids'][0])
                 # print('masked_pos',inputs['masked_pos'][0])
                 # print('masked_ids',inputs['masked_ids'][0])
@@ -804,8 +890,7 @@ def test(args, test_dataloader, model, tokenizer, predict_file):
                 #     # input()
                 #     yield img_keys[0], json.dumps(({'caption': '', 'conf': 0}))
                 #     continue
-                tag_tokens = batch[-1]
-                batch = batch[:-1]
+
                 if args.use_cbs:
                     assert args.per_gpu_eval_batch_size==1, args.per_gpu_eval_batch_size
                     constraints = batch[-1]
@@ -819,13 +904,15 @@ def test(args, test_dataloader, model, tokenizer, predict_file):
                     batch = batch[:-1]
                     #!!!!
                     #continue
-
+                tag_tokens = batch[5]
                 batch = tuple(t.to(args.device) for t in batch)
                 inputs = {
                     'input_ids': batch[0], 'attention_mask': batch[1],
                     'token_type_ids': batch[2], 'img_feats': batch[3],
-                    'masked_pos': batch[4],
+                    'masked_pos': batch[4], 'match_ids': batch[6]
                 }
+                torch.set_printoptions(profile="full")
+
                 if args.use_cbs:
                     inputs.update({
                         'fsm': batch[5],
@@ -939,6 +1026,7 @@ def restore_training_settings(args):
         else:
             logger.info('Inference max_seq_length{} max_gen_length{}'.format(args_load.max_seq_length,
                 args_load.max_gen_length))
+
         
     return args_load
 
@@ -1126,6 +1214,9 @@ def main():
     parser.add_argument('--img_embedding_type', type=str, default='continuous')
     parser.add_argument('--grid_n', type=int, default=32)
     parser.add_argument('--grid_factor',  nargs='+',default=['width','height','cx','cy'])
+
+    #---match
+    parser.add_argument('--match_threshold',type=float, default=1.0) #1.0 -> no matching augmentation
     args = parser.parse_args()
 
     global logger
@@ -1135,7 +1226,7 @@ def main():
     args.local_rank = local_rank
     args.nocaps_split = args.nocaps_split.split(',')
     args.num_gpus = get_world_size()
-    args.distributed = args.num_gpus > 1
+    args.distributed = True#args.num_gpus > 1
     torch.cuda.set_device(args.local_rank)
     args.device = torch.device('cuda:{}'.format(args.local_rank))
     if args.amp:
@@ -1177,6 +1268,8 @@ def main():
         config.img_embedding_type = args.img_embedding_type
         config.grid_n = args.grid_n
         config.grid_factor = args.grid_factor
+        config.use_match = args.match_threshold<1
+        config.max_seq_a_len = args.max_seq_a_length
         model = model_class.from_pretrained(args.model_name_or_path,
                 from_tf=bool('.ckpt' in args.model_name_or_path), config=config)
     else:

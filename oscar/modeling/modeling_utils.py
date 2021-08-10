@@ -283,7 +283,6 @@ class CaptionPreTrainedModel(BertPreTrainedModel):
         # current position / max lengths / length of generated sentences / unfinished sentences
         unfinished_sents = []
         cur_unfinished = input_ids.new(batch_size).fill_(1)
-
         # log of scores for each sentence in the batch
         logprobs = []
 
@@ -306,7 +305,6 @@ class CaptionPreTrainedModel(BertPreTrainedModel):
             assert outputs[0].shape[1] == token_len
 
             next_token_logits = outputs[0][:, next_token_idx, :]
-
             # if model has past, then set the past variable to speed up decoding
             if self._do_output_past(outputs):
                 past = outputs[1]
@@ -343,13 +341,9 @@ class CaptionPreTrainedModel(BertPreTrainedModel):
             tokens_to_add = next_token * cur_unfinished + pad_token_id * (1 - cur_unfinished)
             input_ids = torch.cat([input_ids, tokens_to_add.unsqueeze(-1)], dim=-1)
 
-            #for t in input_ids:
-                #print(self.tokenizer.convert_ids_to_tokens(t.tolist()))
-
             for eos_token_id in eos_token_ids:
                 cur_unfinished = cur_unfinished.mul(tokens_to_add.ne(eos_token_id).long())
             cur_len = cur_len + 1
-
             # stop when there is a </s> in each sentence, or if we exceed the maximul length
             if cur_unfinished.max() == 0:
                 break
@@ -357,7 +351,6 @@ class CaptionPreTrainedModel(BertPreTrainedModel):
         # add eos_token_ids to unfinished sentences
         if cur_len == max_length:
             input_ids[:, -1].masked_fill_(cur_unfinished.to(dtype=torch.bool), eos_token_ids[0])
-
         logprobs = torch.cat(logprobs, dim=1)
         unfinished_sents = torch.stack(unfinished_sents, dim=1).float()
         sum_logprobs = (logprobs * unfinished_sents).sum(dim=1)
@@ -543,13 +536,7 @@ class CaptionPreTrainedModel(BertPreTrainedModel):
             traces['predicted_ids'].append(beam_words.cpu().tolist())
             traces['scores'].append(beam_scores.cpu().tolist())
             traces['beam_parent_ids'].append(beam_idx.cpu().tolist())
-            # print(input_ids.cpu().numpy(),beam_scores.cpu().numpy())
-            # print(beam_words.cpu().tolist())
-            # print(beam_scores.cpu().tolist())
-            # print(beam_idx.cpu().tolist())
-            # input()
-            # print(traces[-1])
-            # input()
+
             # re-order internal states
             if past:
                 reordered_past = []
