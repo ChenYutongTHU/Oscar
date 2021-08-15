@@ -81,7 +81,7 @@ class CaptionKaraDataset(torch.utils.data.IterableDataset):
         self.storage_open = self.storage.open_dataset(self.cfg['split0'], self.cfg['split1'], 
             "r", serialization=FeatureSerializer())
         self.iterable_ImgDataset = kara_storage.make_torch_dataset(self.storage_open, 
-            shuffle=False, auto_distributed=is_distributed and is_train) #shuffle!
+            shuffle=is_train, auto_distributed=is_distributed and is_train) #shuffle!
  
         #print(len(self.iterable_ImgDataset))
         with open(self.cfg['label_path'],'r') as f:
