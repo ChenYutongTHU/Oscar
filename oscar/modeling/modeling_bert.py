@@ -185,16 +185,9 @@ class BertImgModel(BertPreTrainedModel):
                 self.img_embedding = nn.Linear(self.img_dim, self.config.hidden_size, bias=True)
             elif self.img_embedding_type=='grid':
                 self.img_embedding_feature = nn.Linear(self.img_dim-6, self.config.hidden_size, bias=True)
-                if 'width' in self.grid_factor:
-                    self.img_embedding_width = nn.Embedding(260, self.config.hidden_size)
-                if 'height' in self.grid_factor:
-                    self.img_embedding_height = nn.Embedding(260, self.config.hidden_size)
-                if 'cx' in self.grid_factor:
-                    self.img_embedding_cx = nn.Embedding(260, self.config.hidden_size)
-                if 'cy' in self.grid_factor:
-                    self.img_embedding_cy = nn.Embedding(260, self.config.hidden_size)
-                if 'area' in self.grid_factor:
-                    self.img_embedding_area = nn.Embedding(260, self.config.hidden_size) #n 9*9=81
+                for k in ['width','height','cx','cy','area','x1','y1','x2','y2']:
+                    if k in self.grid_factor:
+                        setattr(self, 'img_embedding_{}'.format(k), nn.Embedding(260, self.config.hidden_size))
             else: #None
                 self.img_embedding = nn.Linear(self.img_dim-6, self.config.hidden_size, bias=True)
             self.dropout = nn.Dropout(config.hidden_dropout_prob)
@@ -292,28 +285,22 @@ class BertImgModel(BertPreTrainedModel):
                     img_embedding_output = self.img_embedding(img_feats)
                 elif self.img_embedding_type=='grid':
                     region_feats = img_feats[:,:,:-6]
+                    position_info = {}
                     pos_feats = img_feats[:,:,-6:] #x1,y1,x2,y2,w,h
-                    center_x = (pos_feats[:,:,0]+pos_feats[:,:,2])/2
-                    center_y = (pos_feats[:,:,1]+pos_feats[:,:,3])/2
-                    width, height = pos_feats[:,:,4], pos_feats[:,:,5]
-                    area = width*height
+                    position_info['x1'], position_info['x2'] = pos_feats[:,:,0], pos_feats[:,:,2]
+                    position_info['y1'], position_info['y2'] = pos_feats[:,:,1], pos_feats[:,:,3]
+                    position_info['cx'] = (pos_feats[:,:,0]+pos_feats[:,:,2])/2
+                    position_info['cy'] = (pos_feats[:,:,1]+pos_feats[:,:,3])/2
+                    position_info['width'], position_info['height'] = pos_feats[:,:,4], pos_feats[:,:,5]
+                    position_info['area'] = position_info['width']*position_info['height']
                     region_embedding = self.img_embedding_feature(region_feats)
                     img_embedding_output = region_embedding
-                    if 'cx' in self.grid_factor:
-                        cx_embedding = self.img_embedding_cx(self.quantization(center_x))
-                        img_embedding_output += cx_embedding
-                    if 'cy' in self.grid_factor:
-                        cy_embedding = self.img_embedding_cy(self.quantization(center_y))
-                        img_embedding_output += cy_embedding
-                    if 'width' in self.grid_factor:
-                        w_embedding = self.img_embedding_width(self.quantization(width))
-                        img_embedding_output += w_embedding
-                    if 'height' in self.grid_factor:
-                        h_embedding = self.img_embedding_height(self.quantization(height))
-                        img_embedding_output += h_embedding
-                    if 'area' in self.grid_factor:
-                        area_embedding = self.img_embedding_area(self.quantization(area, is_area=True))
-                        img_embedding_output += area_embedding                       
+                    for k in self.grid_factor:
+                        embedding_layer = getattr(self, 'img_embedding_{}'.format(k))
+                        k_embedding = embedding_layer(self.quantization(position_info[k], 
+                            is_area=(k=='area')))
+                        img_embedding_output += k_embedding
+
                 else: #None
                     img_embedding_output = self.img_embedding(img_feats[:,:,:-6])
 
