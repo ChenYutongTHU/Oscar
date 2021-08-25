@@ -161,9 +161,9 @@ class BertImgModel(BertPreTrainedModel):
         logger.info('BertImgModel Image Dimension: {}'.format(self.img_dim))
         self.img_feature_type = config.img_feature_type
         self.img_embedding_type = config.img_embedding_type
-        self.grid_n = config.grid_n
-        self.grid_factor = config.grid_factor
-        self.use_match = config.use_match
+        self.grid_n = getattr(config, 'grid_n', None)
+        self.grid_factor = getattr(config, 'grid_factor', [])
+        self.use_match = getattr(config, 'use_match', False)
 
         if hasattr(config, 'use_img_layernorm'):
             self.use_img_layernorm = config.use_img_layernorm

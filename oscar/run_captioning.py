@@ -1016,6 +1016,11 @@ def restore_training_settings(args):
                 'resumed grid_factor {}, load grid_factor {}'.format(args_load.grid_factor,args.grid_factor)
         args_load.grid_factor = args.grid_factor
 
+        if hasattr(args_load, 'match_threshold'):
+            assert args.match_threshold == args_load.match_threshold, \
+                'resumed match_threshold {}, load match_threshold {}'.format(args_load.match_threshold,args.match_threshold)
+        args_load.match_threshold = args.match_threshold
+
         if args_load.scst==False:
             logger.info('Inference Override --  ')
             logger.info('max_seq_length {} --> '.format(args_load.max_seq_length))
@@ -1276,6 +1281,12 @@ def main():
         checkpoint = args.eval_model_dir
         assert op.isdir(checkpoint)
         config = config_class.from_pretrained(checkpoint)
+        
+        config.img_embedding_type = args.img_embedding_type
+        config.grid_n = args.grid_n
+        config.grid_factor = args.grid_factor
+        config.use_match = args.match_threshold<1
+
         config.output_hidden_states = args.output_hidden_states
         tokenizer = tokenizer_class.from_pretrained(checkpoint)
         logger.info("Evaluate the following checkpoint: %s", checkpoint)
