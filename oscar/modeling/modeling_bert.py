@@ -16,7 +16,7 @@ from oscar_transformers.pytorch_transformers.modeling_bert import (BertEmbedding
         load_tf_weights_in_bert)
 from .modeling_utils import CaptionPreTrainedModel, ImgPreTrainedModel
 from ..utils.cbs import ConstrainedBeamSearch, select_best_beam_with_constraints
-
+import random
 logger = logging.getLogger(__name__)
 
 
@@ -281,6 +281,36 @@ class BertImgModel(BertPreTrainedModel):
                 code_emb = self.code_embeddings(img_feats)
                 img_embedding_output = self.img_embedding(code_emb)
             else: #b，l，-6: （x1,x2,y1,y2,w,h）
+                #perturbation!!
+                #img_feats[:,:,-6:] 
+                if getattr(self.config, 'permute', False):
+                    #print('before permute {}'.format(img_feats[0,0,-6:]))
+                    position_feats = img_feats[:,:,-6:] #B,L,6
+                    idx = list(range(img_feats.shape[1]))
+                    random.shuffle(idx)
+                    permute_position_feats = position_feats[:,idx,:]
+                    #print(img_feats.shape, permute_position_feats.shape)
+                    img_feats = torch.cat([img_feats[:,:,:-6],permute_position_feats], dim=-1)
+                    # print('after permute {}'.format(img_feats[0,0,-6:]))
+                    # input()
+
+                elif getattr(self.config,'perturbation_scale',0)>0:
+                    #print('before perturb {}'.format(img_feats[0,0,-6:]))
+                    width, height = img_feats[:,:,-2], img_feats[:,:,-1] #B,L
+                    dx_range = (width*self.config.perturbation_scale).unsqueeze(-1)
+                    dy_range = (height*self.config.perturbation_scale).unsqueeze(-1)
+                    B,L = img_feats.shape[0], img_feats.shape[1]
+                    dx = torch.rand([B,L,2], dtype=img_feats.dtype, device=img_feats.device)*dx_range
+                    dy = torch.rand([B,L,2], dtype=img_feats.dtype, device=img_feats.device)*dy_range
+                    img_feats[:,:,-6] += dx[:,:,0]
+                    img_feats[:,:,-5] += dy[:,:,0]
+                    img_feats[:,:,-4] += dx[:,:,1]
+                    img_feats[:,:,-3] += dy[:,:,1]
+                    img_feats[:,:,-2] = img_feats[:,:,-4] - img_feats[:,:,-6]
+                    img_feats[:,:,-1] = img_feats[:,:,-3] - img_feats[:,:,-5]
+                    #print('after perturb {}'.format(img_feats[0,0,-6:]))
+                    #input()
+
                 if self.img_embedding_type=='continuous':
                     img_embedding_output = self.img_embedding(img_feats)
                 elif self.img_embedding_type=='grid':

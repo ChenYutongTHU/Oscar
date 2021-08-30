@@ -973,6 +973,8 @@ def test(args, test_dataloader, model, tokenizer, predict_file):
 
 def restore_training_settings(args):
     if args.do_train:
+        assert args.perturbation_scale==0
+        assert args.permute==False
         if not args.scst:
             return args    
         else: # args.scst
@@ -1021,6 +1023,8 @@ def restore_training_settings(args):
                 'resumed match_threshold {}, load match_threshold {}'.format(args_load.match_threshold,args.match_threshold)
         args_load.match_threshold = args.match_threshold
 
+        args_load.perturbation_scale = args.perturbation_scale
+        args_load.permute = args.permute
         if args_load.scst==False:
             logger.info('Inference Override --  ')
             logger.info('max_seq_length {} --> '.format(args_load.max_seq_length))
@@ -1222,6 +1226,10 @@ def main():
 
     #---match
     parser.add_argument('--match_threshold',type=float, default=1.0) #1.0 -> no matching augmentation
+
+    #--perturbation
+    parser.add_argument('--perturbation_scale',type=float, default=0)
+    parser.add_argument('--permute',action='store_true')
     args = parser.parse_args()
 
     global logger
@@ -1281,12 +1289,13 @@ def main():
         checkpoint = args.eval_model_dir
         assert op.isdir(checkpoint)
         config = config_class.from_pretrained(checkpoint)
-        
+
         config.img_embedding_type = args.img_embedding_type
         config.grid_n = args.grid_n
         config.grid_factor = args.grid_factor
         config.use_match = args.match_threshold<1
-
+        config.perturbation_scale = args.perturbation_scale
+        config.permute = args.permute
         config.output_hidden_states = args.output_hidden_states
         tokenizer = tokenizer_class.from_pretrained(checkpoint)
         logger.info("Evaluate the following checkpoint: %s", checkpoint)
@@ -1335,8 +1344,9 @@ def main():
 
         for name in test_dataloader:
             if not args.do_eval:  #no need to produce evaluation results (bleu, meteor...)
-                predict_file = get_predict_file(checkpoint, test_dataloader[name].dataset.yaml_file, args,
+                predict_file = get_predict_file(args.output_dir, test_dataloader[name].dataset.yaml_file, args,
                     None,name)
+                print(predict_file)
                 test(args, test_dataloader[name], model, tokenizer, predict_file)
                 logger.info("Prediction {} results saved to: {}".format(name, predict_file))
                 #coco format
@@ -1346,7 +1356,8 @@ def main():
 
             else: # produce evaluation results
                 evaluate_file = evaluate(args, test_dataloader[name], model, tokenizer,
-                        checkpoint, None, dataset=name)
+                        args.output_dir, None, dataset=name)
+                #evaluate(args, val_dataloader, model, tokenizer, output_dir, epoch, dataset='coco')
                 logger.info("Evaluation results saved to: {}".format(evaluate_file))
 
 if __name__ == "__main__":
