@@ -313,6 +313,7 @@ class BertImgModel(BertPreTrainedModel):
 
                 if self.img_embedding_type=='continuous':
                     img_embedding_output = self.img_embedding(img_feats)
+                    
                 elif self.img_embedding_type=='grid':
                     region_feats = img_feats[:,:,:-6]
                     position_info = {}

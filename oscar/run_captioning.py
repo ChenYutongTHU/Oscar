@@ -131,7 +131,7 @@ class CaptionKaraDataset(torch.utils.data.IterableDataset):
             example = self.tensorizer.tensorize_example(text_a=caps, text_b=od_labels, img_feat=torch.Tensor(features),
                 sequence_a_segment_id=self.kwargs['cap_segment_id'], 
                 sequence_b_segment_id=self.kwargs['tag_segment_id'],
-                match=self.match[img_id],
+                match=self.match[img_id] if self.match else None,
                 match_threshold=self.match_threshold)  #tag -> 0 caption -> 1
             yield img_id, example
 
@@ -219,23 +219,25 @@ class CaptionTensorizer(object):
             padded_tokens_b = padded_tokens_b + [self.tokenizer.pad_token]*(self.max_seq_len - len(tokens) - 1 - len(padded_tokens_b))
 
         #match [[tag,tag_id->segment,region_id]]
-        assert match!=None
         match_ids = []
-        offset = 0#len(tokens) we plus offset in model forwarding (adapting to len(input_lens))
-        #print('offset', len(tokens), self.max_seq_a_len)
-        for ii, (seg, m, t) in enumerate(zip(segments, match[:len(segments)], tags_valid)): 
-            if not m[0]==t:
-                for jj, (m_,t_,tb) in enumerate(zip(match, tags_valid, text_b)):
-                    print(jj, m_[0], t_,tb)
-            assert m[0]==t, (m[0],t,i)
+        if match:
+            offset = 0#len(tokens) we plus offset in model forwarding (adapting to len(input_lens))
+            #print('offset', len(tokens), self.max_seq_a_len)
+            for ii, (seg, m, t) in enumerate(zip(segments, match[:len(segments)], tags_valid)): 
+                if not m[0]==t:
+                    for jj, (m_,t_,tb) in enumerate(zip(match, tags_valid, text_b)):
+                        print(jj, m_[0], t_,tb)
+                assert m[0]==t, (m[0],t,i)
 
-            if not m[-1]>match_threshold or m[2]>=self.max_img_seq_len:
-                continue
-            s, t = seg
-            #assert s==len(match_ids), segments 
-            for i in range(s,t):
-                match_ids.append([i+offset, m[2]]) # m [tag, tag_id, region_id, region_iou]
-        #padding
+                if not m[-1]>match_threshold or m[2]>=self.max_img_seq_len:
+                    continue
+                s, t = seg
+                #assert s==len(match_ids), segments 
+                for i in range(s,t):
+                    match_ids.append([i+offset, m[2]]) # m [tag, tag_id, region_id, region_iou]
+            #padding
+        else:
+            assert match_threshold==1, (match_threshold)
         self.match_len = len(match_ids)
         if len(match_ids) < self.max_tag_len:
             match_ids = match_ids + \
@@ -670,9 +672,6 @@ def train(args, train_dataloader, val_dataset, model, tokenizer, writer):
 
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 global_step += 1
-                scheduler.step()
-                optimizer.step()
-                model.zero_grad()
                 if global_step % args.logging_steps == 0:
                     logger.info("Epoch: {}, global_step: {}, lr: {:.6f}, loss: {:.4f}, " \
                         "score: {:.4f}".format(epoch, global_step, 
@@ -682,6 +681,49 @@ def train(args, train_dataloader, val_dataset, model, tokenizer, writer):
                         writer.add_scalar('loss', loss, global_step=global_step)
                         writer.add_scalar('batch_acc', batch_acc, global_step=global_step)
                         writer.add_scalar('lr', optimizer.param_groups[0]["lr"], global_step=global_step)
+
+                    #!! visualize continuous img embedding
+                    if args.img_embedding_type == 'continuous' and writer!=None:
+                        assert model.module.bert.img_embedding.weight.shape == torch.Size([768, 2054])
+                        weights = {'value': model.module.bert.img_embedding.weight[:,:2048],
+                                    'pos': model.module.bert.img_embedding.weight[:,-6:]}
+                        grads = {'value':model.module.bert.img_embedding.weight.grad[:,:2048],
+                                'pos':model.module.bert.img_embedding.weight.grad[:,-6:]}
+
+                        outputs_hs = {}
+                        inputs_examples = inputs['img_feats'][0:1,0,:] #B=1,D
+                        with torch.no_grad():
+                            outputs_hs['value'] = torch.matmul(inputs_examples[:,:2048], 
+                                weights['value'].t()) #B,d d,m ->B,m
+                            outputs_hs['pos'] = torch.matmul(inputs_examples[:,-6:], 
+                                weights['pos'].t()) #B,d d,m ->B,m
+
+                        def draw_norms(writer, data_dict, name, step):
+                            norms = {}
+                            for n, e in data_dict.items():
+                                if name=='outputs':
+                                    #shape = 1,M
+                                    norms[n] = torch.norm(e[0])
+                                else:
+                                    #shape = M,N (768, 2048/6)
+                                    norms[n] = torch.mean(torch.norm(e, dim=0)) # /2048 or 6
+                                writer.add_scalar('{}_{}'.format(name,n),
+                                    norms[n],
+                                    global_step=step)
+                            writer.add_scalar('{}_pos_value'.format(name),
+                                norms['pos']/norms['value'],
+                                global_step=step)
+
+
+                        # 1.weight norm and their ratio
+                        draw_norms(writer, weights, 'weights', global_step)
+                        # 2.grad norm and their ratio
+                        draw_norms(writer, grads, 'grads', global_step)
+                        # 3.outputs norm and their ratio
+                        draw_norms(writer, outputs_hs, 'outputs', global_step)
+                scheduler.step()
+                optimizer.step()
+                model.zero_grad()
 
 
         if is_main_process():
@@ -1036,6 +1078,8 @@ def restore_training_settings(args):
             logger.info('Inference max_seq_length{} max_gen_length{}'.format(args_load.max_seq_length,
                 args_load.max_gen_length))
 
+        args_load.test_yaml = args.test_yaml
+        args_load.val_yaml = args.val_yaml
         
     return args_load
 
@@ -1231,6 +1275,7 @@ def main():
     parser.add_argument('--perturbation_scale',type=float, default=0)
     parser.add_argument('--permute',action='store_true')
     args = parser.parse_args()
+
 
     global logger
 
